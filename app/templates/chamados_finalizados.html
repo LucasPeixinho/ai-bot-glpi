@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block titulo %}Chamados finalizados - Suporte de TI{% endblock %}
+{% block estilo_extra %}
+<style>
+  .pagina-hub {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    justify-content: center;
+    background: var(--bg);
+    padding: 16px;
+  }
+  .janela-hub { width: 100%; max-width: 640px; display: flex; flex-direction: column; gap: 22px; padding: 24px 0; }
+  .cabecalho-hub { display: flex; align-items: center; gap: 10px; }
+  .cabecalho-hub strong { font: 700 15px 'Inter', sans-serif; color: var(--texto-forte); }
+  .lista-chamados { display: flex; flex-direction: column; gap: 12px; }
+  .item-chamado {
+    background: var(--superficie);
+    border: 1px solid var(--borda);
+    border-radius: 12px;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    text-decoration: none;
+    color: inherit;
+    transition: border-color .15s, background .15s;
+  }
+  .item-chamado:hover { border-color: var(--borda-forte); background: var(--superficie-forte); }
+  .item-chamado-numero { font: 600 11px 'JetBrains Mono', monospace; color: var(--azul-link); }
+  .item-chamado-titulo { font: 600 13.5px 'Inter', sans-serif; color: var(--texto-forte); }
+  .item-chamado-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-start;
+    font: 600 11.5px 'Inter', sans-serif;
+    color: var(--status-fechado-texto);
+  }
+  .item-chamado-status::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+  .estado-vazio-hub { text-align: center; color: var(--texto-fraco); padding: 30px 16px; font-size: .9rem; }
+</style>
+{% endblock %}
+{% block conteudo %}
+<div class="pagina-hub">
+  <div class="janela-hub">
+    <div class="cabecalho-hub">
+      <a class="botao-icone" href="/chamados" aria-label="Voltar">←</a>
+      <strong>Chamados finalizados</strong>
+    </div>
+    <div class="lista-chamados">
+      {% for c in finalizados %}
+      <a class="item-chamado" href="/chamados/{{ c.id }}">
+        <span class="item-chamado-numero">#{{ c.id }}</span>
+        <span class="item-chamado-titulo">{{ c.titulo }}</span>
+        <span class="item-chamado-status">Fechado</span>
+      </a>
+      {% else %}
+      <p class="estado-vazio-hub">Nenhum chamado finalizado ainda.</p>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endblock %}

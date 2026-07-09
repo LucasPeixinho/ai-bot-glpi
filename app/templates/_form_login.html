@@ -1,0 +1,13 @@
+{% if erro %}
+  <div class="erro">{{ erro }}</div>
+{% endif %}
+<form hx-post="/login" hx-target="#area-login" hx-swap="innerHTML">
+  <label for="login">Usuário de rede</label>
+  <input type="text" id="login" name="login" autocomplete="username"
+         value="{{ login_tentado or '' }}" autofocus required>
+  <label for="senha" style="margin-top:14px">Senha</label>
+  <input type="password" id="senha" name="senha" autocomplete="current-password" required>
+  <div class="linha-botoes">
+    <button type="submit" class="primario">Entrar</button>
+  </div>
+</form>

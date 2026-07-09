@@ -1,0 +1,921 @@
+{% extends "base.html" %}
+{% block titulo %}Chat - Suporte de TI{% endblock %}
+{% block estilo_extra %}
+<style>
+  .pagina-chat {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    justify-content: center;
+    background: var(--bg);
+    padding: 16px;
+  }
+  .janela-chat {
+    width: 100%;
+    max-width: 640px;
+    display: flex;
+    flex-direction: column;
+    height: calc(100dvh - 32px);
+    background: var(--bg);
+    border: 1px solid var(--borda-fraca);
+    border-radius: 16px;
+    box-shadow: 0 20px 50px -12px rgba(0,0,0,.6);
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* cabecalho */
+  .cabecalho {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--borda-fraca);
+    flex-wrap: wrap;
+  }
+  .cabecalho-info { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .cabecalho-avatar {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: var(--azul-gradiente);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .cabecalho-avatar svg { width: 18px; height: 18px; color: #fff; }
+  .cabecalho-info strong {
+    display: block;
+    font: 700 14px 'Inter', sans-serif;
+    color: var(--texto-forte);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cabecalho-info .subtitulo {
+    font: 400 11px 'Inter', sans-serif;
+    color: var(--texto-fraco);
+  }
+  .cabecalho-acoes {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .pill-status {
+    font: 600 11.5px 'Inter', sans-serif;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--superficie-forte);
+    color: var(--texto-suave);
+    white-space: nowrap;
+  }
+  .pill-status.pill-suporte {
+    background: var(--teal-bg);
+    color: var(--teal-texto);
+    border: 1px solid var(--teal-borda);
+  }
+
+  /* historico */
+  .historico {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 24px;
+    display: flex;
+    flex-direction: column;
+  }
+  /* o x-for envolve cada mensagem num <div> (uma tag por causa/varias
+     x-if dentro) - esse <div> precisa ser flex tambem, na mesma direcao
+     do .historico, senao os "align-self" dos filhos (bolha do usuario a
+     direita, avisos/cards centralizados) nao tem nenhum efeito: eles so
+     funcionam quando o PAI direto e um container flex. Sem isso, tudo
+     colava na esquerda e o align-self era ignorado silenciosamente. */
+  .linha-mensagem { display: flex; flex-direction: column; width: 100%; }
+
+  .estado-vazio {
+    margin: auto;
+    text-align: center;
+    color: var(--texto-fraco);
+    max-width: 300px;
+    padding: 20px;
+  }
+  .estado-vazio-icone {
+    width: 40px;
+    height: 40px;
+    margin: 0 auto 14px;
+    border-radius: 12px;
+    background: var(--superficie-forte);
+    border: 1px solid var(--borda);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .estado-vazio-icone svg { width: 20px; height: 20px; color: var(--azul-link); }
+  .estado-vazio p { font-size: .95rem; line-height: 1.5; margin: 0; }
+
+  /* grupos de mensagem (usuario / assistente / suporte) */
+  .grupo-mensagem {
+    display: flex;
+    flex-direction: column;
+    max-width: 82%;
+    margin-top: 4px;
+  }
+  .grupo-mensagem.novo-grupo { margin-top: 20px; }
+  .grupo-mensagem.usuario { align-self: flex-end; align-items: flex-end; max-width: 70%; }
+  .grupo-mensagem.assistente,
+  .grupo-mensagem.suporte { align-self: flex-start; align-items: flex-start; }
+
+  .rotulo-autor {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font: 600 11.5px 'Inter', sans-serif;
+    color: var(--texto-fraco);
+    margin-bottom: 6px;
+  }
+  .rotulo-autor .avatar {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--superficie-forte);
+    border: 1px solid var(--borda);
+  }
+  .avatar svg { width: 12px; height: 12px; color: var(--texto-suave); }
+  .grupo-mensagem.suporte .rotulo-autor { color: var(--teal-texto); }
+  .grupo-mensagem.suporte .rotulo-autor .avatar {
+    background: var(--teal-bg);
+    border-color: var(--teal-borda);
+  }
+  .grupo-mensagem.suporte .rotulo-autor .avatar svg { color: var(--teal-texto); }
+
+  .ferramenta {
+    font-size: .8rem;
+    color: var(--texto-fraco);
+    font-style: italic;
+    margin-bottom: 4px;
+  }
+
+  .bolha {
+    padding: 14px 16px;
+    border-radius: 14px 14px 14px 4px;
+    line-height: 1.6;
+    font: 400 13px 'Inter', sans-serif;
+    color: var(--texto);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .bolha strong { color: var(--texto-forte); font-weight: 600; }
+  .grupo-mensagem.usuario .bolha {
+    background: var(--azul-gradiente);
+    color: #fff;
+    font-weight: 600;
+    border-radius: 14px 14px 4px 14px;
+  }
+  .grupo-mensagem.usuario .bolha strong { color: #fff; }
+  .grupo-mensagem.assistente .bolha,
+  .grupo-mensagem.suporte .bolha {
+    background: var(--superficie-forte);
+    border: 1px solid var(--borda);
+  }
+
+  .timestamp {
+    font-size: .72rem;
+    color: var(--texto-minimo);
+    margin-top: 5px;
+    padding: 0 3px;
+  }
+
+  /* eventos: divisores e cards */
+  .divisor-sistema {
+    align-self: center;
+    font-size: .78rem;
+    color: var(--texto-fraco);
+    text-align: center;
+    font-style: italic;
+    margin: 18px auto 10px;
+    max-width: 90%;
+  }
+
+  .badge-tecnico-assumiu {
+    align-self: center;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--teal-bg);
+    border: 1px solid var(--teal-borda);
+    color: var(--teal-texto);
+    font-size: .8rem;
+    font-weight: 600;
+    padding: 7px 16px;
+    border-radius: 999px;
+    margin: 20px auto 10px;
+  }
+  .badge-tecnico-assumiu .icone-headset { width: 14px; height: 14px; flex-shrink: 0; }
+
+  .card-chamado,
+  .card-resolvido {
+    align-self: center;
+    width: 100%;
+    max-width: 92%;
+    border-radius: 14px;
+    padding: 14px 16px;
+    margin: 16px auto;
+    background: var(--verde-bg);
+    border: 1px solid var(--verde-borda);
+  }
+  .card-chamado-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font: 700 11px 'Inter', sans-serif;
+    letter-spacing: .02em;
+    color: var(--verde);
+    margin-bottom: 6px;
+  }
+  .card-chamado-check svg { width: 13px; height: 13px; flex-shrink: 0; }
+  .card-chamado-numero {
+    font: 700 1.4rem/1.2 'Inter', sans-serif;
+    color: var(--texto-forte);
+  }
+  .card-chamado-titulo { font: 600 13px 'Inter', sans-serif; color: var(--texto-forte); margin-top: 4px; }
+  .card-chamado-categoria { font: 400 11.5px 'Inter', sans-serif; color: var(--texto-suave); margin-top: 6px; }
+
+  .card-resolvido-titulo {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font: 700 12px 'Inter', sans-serif;
+    color: var(--verde);
+    margin-bottom: 8px;
+  }
+  .card-resolvido-texto {
+    font: 400 13px/1.6 'Inter', sans-serif;
+    color: var(--texto);
+    white-space: pre-wrap;
+  }
+  .card-resolvido-prazo {
+    font-size: .78rem;
+    color: var(--texto-fraco);
+    margin-top: 10px;
+  }
+  .card-resolvido-botoes {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+  }
+  .card-resolvido-botoes button { flex: 1; }
+  .card-resolvido-form {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .card-resolvido-form textarea {
+    width: 100%;
+    min-height: 70px;
+    padding: 10px 12px;
+    border: 1px solid var(--borda-forte);
+    border-radius: 8px;
+    background: var(--superficie-fraca);
+    color: var(--texto-forte);
+    font: 400 13px 'Inter', sans-serif;
+    resize: vertical;
+  }
+  .card-resolvido-form textarea:focus {
+    outline: none;
+    border-color: var(--azul);
+    box-shadow: 0 0 0 3px rgba(76,141,255,.18);
+  }
+  .card-resolvido-erro {
+    font-size: .78rem;
+    color: var(--erro-texto);
+  }
+  .card-resolvido-respondido {
+    font-size: .82rem;
+    color: var(--verde);
+    font-weight: 600;
+    margin-top: 12px;
+  }
+
+  /* digitando */
+  .digitando {
+    align-self: flex-start;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 22px;
+  }
+  .digitando .avatar {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--superficie-forte);
+    border: 1px solid var(--borda);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .digitando .avatar svg { color: var(--texto-suave); }
+  .pontinhos {
+    display: flex;
+    gap: 3px;
+    padding: 10px 14px;
+    background: var(--superficie-forte);
+    border: 1px solid var(--borda);
+    border-radius: 14px;
+    border-bottom-left-radius: 4px;
+  }
+  .pontinhos span {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--texto-suave);
+    animation: pulso 1.2s infinite ease-in-out;
+  }
+  .pontinhos span:nth-child(2) { animation-delay: .2s; }
+  .pontinhos span:nth-child(3) { animation-delay: .4s; }
+  @keyframes pulso {
+    0%, 60%, 100% { opacity: .3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-2px); }
+  }
+
+  /* mensagens da IA/suporte entram com um fade + leve deslize, em vez de
+     aparecer instantaneamente */
+  @media (prefers-reduced-motion: no-preference) {
+    .grupo-mensagem, .card-chamado, .card-resolvido, .badge-tecnico-assumiu {
+      animation: entrada .2s ease-out;
+    }
+  }
+  @keyframes entrada {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* rodape */
+  .rodape-chat {
+    border-top: 1px solid var(--borda-fraca);
+    padding: 16px 20px calc(16px + env(safe-area-inset-bottom));
+    display: flex;
+    gap: 10px;
+    background: var(--bg);
+  }
+  .rodape-chat input[type=text] {
+    flex: 1;
+    height: 42px;
+    border-radius: 10px;
+  }
+  .rodape-chat button.primario {
+    width: 64px;
+    height: 42px;
+    border-radius: 10px;
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  .aviso-somente-leitura {
+    padding: 14px 20px calc(14px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--borda-fraca);
+    text-align: center;
+    font-size: .85rem;
+    color: var(--texto-fraco);
+  }
+
+  /* telas bem estreitas (celulares pequenos) - aproveita mais largura */
+  @media (max-width: 380px) {
+    .pagina-chat { padding: 0; }
+    .janela-chat { border-radius: 0; border-left: none; border-right: none; height: 100dvh; }
+    .grupo-mensagem { max-width: 90%; }
+    .grupo-mensagem.usuario { max-width: 80%; }
+  }
+</style>
+{% endblock %}
+{% block conteudo %}
+<div class="pagina-chat"
+     x-data="chatApp({{ mensagens_iniciais_json }}, '{{ modo }}', {{ chamado_json }}, {{ 'true' if somente_leitura else 'false' }})"
+     x-init="focoInicial(); iniciarPollingNovidades()">
+  <div class="janela-chat">
+
+    <header class="cabecalho">
+      <div class="cabecalho-info">
+        <a class="botao-icone" href="/chamados" aria-label="Meus chamados">←</a>
+        <div class="cabecalho-avatar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="8" width="16" height="12" rx="3"/>
+            <circle cx="9" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+            <circle cx="15" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+            <path d="M12 8V5"/>
+            <circle cx="12" cy="4" r="1" fill="currentColor" stroke="none"/>
+          </svg>
+        </div>
+        <div style="min-width:0">
+          <strong>{% if modo == 'ajuda' %}Assistente virtual{% else %}Chamado #{{ chamado.id }}{% endif %}</strong>
+          <span class="subtitulo">Suporte de TI · CEDEP</span>
+        </div>
+      </div>
+      <div class="cabecalho-acoes">
+        <span class="pill-status" :class="{'pill-suporte': statusAtual}"
+              x-show="statusPillTexto()" x-text="statusPillTexto()"></span>
+      </div>
+    </header>
+
+    <div class="historico" x-ref="historico">
+      <div class="estado-vazio" x-show="mensagens.length === 0">
+        <div class="estado-vazio-icone">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+          </svg>
+        </div>
+        <p>Conte o que está acontecendo ou o que você precisa.<br>Vou te ajudar a abrir o chamado certo.</p>
+      </div>
+
+      <template x-for="(m, i) in mensagens" :key="m._id">
+        <div class="linha-mensagem">
+          <template x-if="m.tipo === 'sistema'">
+            <div class="divisor-sistema" x-text="m.texto"></div>
+          </template>
+
+          <template x-if="m.tipo === 'tecnico_assumiu'">
+            <div class="badge-tecnico-assumiu">
+              <svg class="icone-headset" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 13v-1a8 8 0 0 1 16 0v1"/>
+                <rect x="3" y="13" width="4" height="6" rx="1.5"/>
+                <rect x="17" y="13" width="4" height="6" rx="1.5"/>
+                <path d="M20 19v1a2 2 0 0 1-2 2h-3"/>
+              </svg>
+              <span x-text="m.nome"></span> entrou no atendimento
+            </div>
+          </template>
+
+          <template x-if="m.tipo === 'chamado_criado'">
+            <div class="card-chamado">
+              <div class="card-chamado-check">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M20 6 9 17l-5-5"/>
+                </svg>
+                CHAMADO ABERTO
+              </div>
+              <div class="card-chamado-numero">#<span x-text="m.id"></span></div>
+              <div class="card-chamado-titulo" x-text="m.titulo"></div>
+              <div class="card-chamado-categoria" x-show="m.categoria" x-text="m.categoria"></div>
+            </div>
+          </template>
+
+          <template x-if="m.tipo === 'resolvido'">
+            <div class="card-resolvido">
+              <div class="card-resolvido-titulo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M20 6 9 17l-5-5"/>
+                </svg>
+                <span x-text="m.mostrarBotoes && !m.jaRespondido ? 'O suporte marcou como resolvido' : 'Chamado resolvido'"></span>
+              </div>
+              <div class="card-resolvido-texto" x-text="m.texto"></div>
+              <div class="card-resolvido-prazo" x-show="m.prazoTexto && !m.jaRespondido" x-text="m.prazoTexto"></div>
+
+              <template x-if="m.mostrarBotoes && !m.jaRespondido && !m.mostrarFormRecusa">
+                <div class="card-resolvido-botoes">
+                  <button type="button" class="primario" :disabled="m.enviando"
+                          @click="confirmarFuncionou(i)">Funcionou</button>
+                  <button type="button" class="secundario" :disabled="m.enviando"
+                          @click="m.mostrarFormRecusa = true">Ainda não resolveu</button>
+                </div>
+              </template>
+
+              <template x-if="m.mostrarFormRecusa && !m.jaRespondido">
+                <div class="card-resolvido-form">
+                  <textarea x-model="m.motivoTexto" placeholder="Conta o que ainda não funcionou..."
+                            :disabled="m.enviando"></textarea>
+                  <div class="card-resolvido-erro" x-show="m.erro" x-text="m.erro"></div>
+                  <div class="card-resolvido-botoes">
+                    <button type="button" class="primario" :disabled="m.enviando"
+                            @click="confirmarNaoResolveu(i)">Enviar</button>
+                    <button type="button" class="secundario" :disabled="m.enviando"
+                            @click="m.mostrarFormRecusa = false; m.erro = null">Cancelar</button>
+                  </div>
+                </div>
+              </template>
+
+              <div class="card-resolvido-respondido" x-show="m.jaRespondido" x-text="m.jaRespondido"></div>
+            </div>
+          </template>
+
+          <template x-if="['usuario', 'assistente', 'suporte'].includes(m.tipo)">
+            <div class="grupo-mensagem" :class="[m.tipo, m.mostrarRotulo ? 'novo-grupo' : '']">
+              <div class="rotulo-autor" x-show="m.mostrarRotulo && m.tipo !== 'usuario'">
+                <span class="avatar">
+                  <svg x-show="m.tipo === 'suporte'" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 13v-1a8 8 0 0 1 16 0v1"/>
+                    <rect x="3" y="13" width="4" height="6" rx="1.5"/>
+                    <rect x="17" y="13" width="4" height="6" rx="1.5"/>
+                    <path d="M20 19v1a2 2 0 0 1-2 2h-3"/>
+                  </svg>
+                  <svg x-show="m.tipo !== 'suporte'" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="4" y="8" width="16" height="12" rx="3"/>
+                    <circle cx="9" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+                    <circle cx="15" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+                    <path d="M12 8V5"/>
+                    <circle cx="12" cy="4" r="1" fill="currentColor" stroke="none"/>
+                  </svg>
+                </span>
+                <span x-text="m.tipo === 'suporte' ? ('Suporte — ' + m.autorNome) : 'Assistente'"></span>
+              </div>
+              <div class="ferramenta" x-show="m.ferramenta" x-text="m.ferramenta"></div>
+              <div class="bolha" x-show="m.texto" x-html="formatarTexto(m.texto)"></div>
+              <div class="timestamp" x-show="m.texto" x-text="m.hora"></div>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <div class="digitando" x-show="digitando" x-cloak>
+        <span class="avatar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="8" width="16" height="12" rx="3"/>
+            <circle cx="9" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+            <circle cx="15" cy="14" r="1.2" fill="currentColor" stroke="none"/>
+            <path d="M12 8V5"/>
+            <circle cx="12" cy="4" r="1" fill="currentColor" stroke="none"/>
+          </svg>
+        </span>
+        <div class="pontinhos"><span></span><span></span><span></span></div>
+      </div>
+    </div>
+
+    <template x-if="somenteLeitura">
+      <div class="aviso-somente-leitura">Este chamado está fechado - só leitura.</div>
+    </template>
+    <form x-show="!somenteLeitura" class="rodape-chat" @submit.prevent="enviar()">
+      <input type="text" x-model="entrada"
+             :placeholder="modo === 'ajuda' ? 'Descreva seu problema...' : 'Escreva uma mensagem pro suporte...'"
+             :disabled="enviando" x-ref="entrada" autocomplete="off">
+      <button type="submit" class="primario" :disabled="enviando || !entrada.trim()">Enviar</button>
+    </form>
+
+  </div>
+</div>
+
+<script>
+function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
+  // Chave estavel por mensagem (_id), NAO o indice do array: o array e
+  // filtrado (bolhas vazias removidas) toda vez que enviar() termina, o
+  // que desloca indices. Usar :key="i" no x-for nesse cenario faz o Alpine
+  // reaproveitar o no DOM errado pra uma mensagem diferente depois de um
+  // filtro - o sintoma classico e um botao "grudado" numa mensagem antiga
+  // que nao responde mais a clique (o handler ainda existe, mas em cima
+  // do dado errado).
+  const comId = (mensagensIniciais || []).map((m, i) => Object.assign({_id: i}, m));
+
+  return {
+    mensagens: comId,
+    _proximoId: comId.length,
+    modo: modo,
+    somenteLeitura: somenteLeitura,
+    entrada: '',
+    enviando: false,
+    digitando: false,
+    statusAtual: chamadoInicial || null,
+    sseFonte: null,
+    sseRecebeuAlgumEvento: false,
+
+    focoInicial() {
+      this.$nextTick(() => this.$refs.entrada && this.$refs.entrada.focus());
+    },
+
+    scrollParaFim() {
+      this.$nextTick(() => {
+        const c = this.$refs.historico;
+        if (c) c.scrollTop = c.scrollHeight;
+      });
+    },
+
+    horaAtual() {
+      return new Date().toLocaleTimeString('pt-BR', {hour: '2-digit', minute: '2-digit'});
+    },
+
+    // A IA (e o historico reconstruido do GLPI) usa **negrito** em
+    // markdown, mas o balao mostrava o texto puro (x-text), entao os
+    // asteriscos apareciam literalmente. Escapa HTML primeiro (o texto
+    // pode vir de qualquer lado - GLPI, usuario, IA - nunca interpretar
+    // como tag), so DEPOIS troca **texto** por <strong>.
+    formatarTexto(texto) {
+      if (!texto) return '';
+      const seguro = texto
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      return seguro.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    },
+
+    rotuloStatus(status) {
+      const rotulos = {1: 'Novo', 2: 'Em atendimento', 3: 'Em atendimento', 4: 'Pendente', 5: 'Resolvido', 6: 'Fechado'};
+      return rotulos[status] || 'Em andamento';
+    },
+
+    statusPillTexto() {
+      if (!this.statusAtual) return '';
+      return '#' + this.statusAtual.id + ' · ' + this.rotuloStatus(this.statusAtual.status);
+    },
+
+    ultimoTipoConversacional() {
+      for (let i = this.mensagens.length - 1; i >= 0; i--) {
+        const m = this.mensagens[i];
+        if (['usuario', 'assistente', 'suporte'].includes(m.tipo)) return m.tipo;
+        return null;
+      }
+      return null;
+    },
+
+    // IMPORTANTE: nunca guardar uma referencia solta a um item do array e
+    // mutar ela depois - o Alpine (via @vue/reactivity) so dispara
+    // re-render quando a mutacao passa pelo proxy reativo do array. Por
+    // isso todo acesso e feito via this.mensagens[indice], nunca via uma
+    // variavel local apontando pro objeto.
+    pushMensagem(tipo, texto, extra) {
+      extra = extra || {};
+      const conversacional = ['usuario', 'assistente', 'suporte'].includes(tipo);
+      const mostrarRotulo = conversacional ? this.ultimoTipoConversacional() !== tipo : false;
+      this.mensagens.push(Object.assign(
+        {_id: this._proximoId++, tipo, texto, ferramenta: null, hora: this.horaAtual(), mostrarRotulo},
+        extra
+      ));
+      return this.mensagens.length - 1;
+    },
+
+    // Fase 5: tenta SSE primeiro (push de verdade, sem o front-end ficar
+    // perguntando toda hora); se a conexao falhar (proxy sem suporte,
+    // rede caiu, etc), cai pro polling classico via fetch - degradacao
+    // suave, o usuario nem percebe a troca.
+    iniciarPollingNovidades() {
+      if (this.modo !== 'chamado') return;
+      this.conectarSSE();
+    },
+
+    conectarSSE() {
+      if (this.somenteLeitura || this.sseFonte) return;
+      const fonte = new EventSource('/chamados/' + this.statusAtual.id + '/eventos');
+      this.sseFonte = fonte;
+      fonte.onmessage = (msg) => {
+        this.sseRecebeuAlgumEvento = true;
+        this.processarEventoNovidade(JSON.parse(msg.data));
+        this.scrollParaFim();
+      };
+      fonte.onerror = () => {
+        fonte.close();
+        this.sseFonte = null;
+        if (this.somenteLeitura) return; // fechou por resolucao normal, nao e falha
+        // so cai pro polling classico se o SSE nunca chegou a funcionar -
+        // se ja tinha funcionado e caiu por um instante, o EventSource
+        // tenta reconectar sozinho (comportamento padrao do browser).
+        if (!this.sseRecebeuAlgumEvento) this.iniciarPollingClassico();
+      };
+    },
+
+    processarEventoNovidade(evento) {
+      if (evento.tipo === 'seguimento_tecnico') {
+        this.pushMensagem('suporte', evento.texto, {autorNome: evento.autor});
+      } else if (evento.tipo === 'tecnico_assumiu') {
+        this.pushMensagem('tecnico_assumiu', '', {nome: evento.nome});
+      } else if (evento.tipo === 'status') {
+        this.pushMensagem('sistema', evento.texto);
+        if (this.statusAtual) this.statusAtual = {id: this.statusAtual.id, status: evento.status};
+      } else if (evento.tipo === 'resolvido') {
+        const novoStatus = evento.mostrarBotoes ? 5 : 6;
+        // enviando/erro/mostrarFormRecusa/jaRespondido/motivoTexto
+        // declarados aqui de proposito (mesmo motivo do lado servidor em
+        // main.py) - nunca deixar o Alpine criar essas chaves em cima da
+        // hora na primeira interacao com o card.
+        this.pushMensagem('resolvido', evento.texto, {
+          mostrarBotoes: evento.mostrarBotoes, prazoTexto: evento.prazoTexto,
+          enviando: false, erro: null, mostrarFormRecusa: false,
+          jaRespondido: null, motivoTexto: '',
+        });
+        if (this.statusAtual) this.statusAtual = {id: this.statusAtual.id, status: novoStatus};
+        this.somenteLeitura = novoStatus === 6;
+        if (this.somenteLeitura && this.sseFonte) { this.sseFonte.close(); this.sseFonte = null; }
+      }
+    },
+
+    iniciarPollingClassico() {
+      const intervalo = setInterval(async () => {
+        if (this.somenteLeitura) { clearInterval(intervalo); return; }
+        try {
+          const resp = await fetch('/chamados/' + this.statusAtual.id + '/novidades');
+          const eventos = await resp.json();
+          if (!eventos.length) return;
+          for (const evento of eventos) this.processarEventoNovidade(evento);
+          this.scrollParaFim();
+        } catch (e) {
+          // silencioso - tenta de novo no proximo ciclo
+        }
+      }, 5000);
+    },
+
+    async confirmarFuncionou(indice) {
+      const m = this.mensagens[indice];
+      m.enviando = true;
+      m.erro = null;
+      try {
+        const resp = await fetch('/chamados/' + this.statusAtual.id + '/aceitar', {method: 'POST'});
+        const corpo = await resp.json();
+        if (!corpo.ok) { m.erro = corpo.erro; return; }
+        m.jaRespondido = 'Você confirmou: funcionou! Chamado fechado. 🎉';
+        this.somenteLeitura = true;
+        if (this.statusAtual) this.statusAtual = {id: this.statusAtual.id, status: 6};
+      } catch (e) {
+        m.erro = 'Não consegui confirmar agora. Tenta de novo.';
+      } finally {
+        m.enviando = false;
+      }
+    },
+
+    async confirmarNaoResolveu(indice) {
+      const m = this.mensagens[indice];
+      const motivo = (m.motivoTexto || '').trim();
+      if (motivo.length < 10) {
+        m.erro = 'Explica com mais detalhes (mínimo 10 caracteres).';
+        return;
+      }
+      m.enviando = true;
+      m.erro = null;
+      try {
+        const corpo_req = new URLSearchParams();
+        corpo_req.set('motivo', motivo);
+        const resp = await fetch('/chamados/' + this.statusAtual.id + '/recusar', {method: 'POST', body: corpo_req});
+        const corpo = await resp.json();
+        if (!corpo.ok) { m.erro = corpo.erro; return; }
+        m.jaRespondido = 'Você disse que ainda não resolveu - o suporte foi avisado.';
+        m.mostrarFormRecusa = false;
+        if (this.statusAtual) this.statusAtual = {id: this.statusAtual.id, status: 2};
+      } catch (e) {
+        m.erro = 'Não consegui registrar agora. Tenta de novo.';
+      } finally {
+        m.enviando = false;
+      }
+    },
+
+    async enviarAjuda(texto) {
+      let indiceAtual = -1;
+      const garantirBolha = () => {
+        if (indiceAtual === -1) indiceAtual = this.pushMensagem('assistente', '');
+      };
+      const novaBolha = () => {
+        indiceAtual = this.pushMensagem('assistente', '');
+      };
+
+      const corpo = new URLSearchParams();
+      corpo.set('mensagem', texto);
+      const resp = await fetch('/chamados/ajuda/mensagem', {method: 'POST', body: corpo});
+      const leitor = resp.body.getReader();
+      const decodificador = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const {done, value} = await leitor.read();
+        if (done) break;
+        buffer += decodificador.decode(value, {stream: true});
+        const linhas = buffer.split('\n');
+        buffer = linhas.pop();
+
+        for (const linha of linhas) {
+          if (!linha.trim()) continue;
+          const evento = JSON.parse(linha);
+
+          if (evento.tipo === 'novo_texto') {
+            this.digitando = false;
+            if (indiceAtual === -1 || this.mensagens[indiceAtual].texto !== '' || this.mensagens[indiceAtual].ferramenta) {
+              novaBolha();
+            }
+          } else if (evento.tipo === 'texto_delta') {
+            this.digitando = false;
+            garantirBolha();
+            this.mensagens[indiceAtual].texto += evento.valor;
+          } else if (evento.tipo === 'ferramenta') {
+            this.digitando = false;
+            if (indiceAtual === -1 || this.mensagens[indiceAtual].texto !== '') {
+              novaBolha();
+            }
+            this.mensagens[indiceAtual].ferramenta = evento.valor;
+          } else if (evento.tipo === 'chamado_criado') {
+            this.pushMensagem('chamado_criado', '', {
+              id: evento.id, titulo: evento.titulo, categoria: evento.categoria,
+            });
+            indiceAtual = -1;
+          } else if (evento.tipo === 'erro') {
+            this.digitando = false;
+            garantirBolha();
+            const atual = this.mensagens[indiceAtual];
+            this.mensagens[indiceAtual].texto = (atual.texto ? atual.texto + '\n' : '') + 'Ops, deu erro: ' + evento.valor;
+            this.mensagens[indiceAtual].ferramenta = null;
+          } else if (evento.tipo === 'fim') {
+            this.enviando = false;
+            this.digitando = false;
+          }
+          this.scrollParaFim();
+        }
+      }
+    },
+
+    async enviarChamado(texto) {
+      // Antes de um tecnico assumir o chamado, a IA continua respondendo
+      // aqui (so passa a ser relay puro depois da atribuicao de verdade -
+      // ver enviar_mensagem_chamado no backend) - por isso trata tanto
+      // 'relay_ok' simples quanto o streaming de texto da IA.
+      let indiceAtual = -1;
+      const garantirBolha = () => {
+        if (indiceAtual === -1) indiceAtual = this.pushMensagem('assistente', '');
+      };
+      const novaBolha = () => {
+        indiceAtual = this.pushMensagem('assistente', '');
+      };
+
+      const corpo = new URLSearchParams();
+      corpo.set('mensagem', texto);
+      const resp = await fetch('/chamados/' + this.statusAtual.id + '/mensagem', {method: 'POST', body: corpo});
+      const leitor = resp.body.getReader();
+      const decodificador = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const {done, value} = await leitor.read();
+        if (done) break;
+        buffer += decodificador.decode(value, {stream: true});
+        const linhas = buffer.split('\n');
+        buffer = linhas.pop();
+
+        for (const linha of linhas) {
+          if (!linha.trim()) continue;
+          const evento = JSON.parse(linha);
+
+          if (evento.tipo === 'relay_ok') {
+            this.digitando = false;
+            this.pushMensagem('sistema', 'Mensagem enviada ao suporte.');
+          } else if (evento.tipo === 'novo_texto') {
+            this.digitando = false;
+            if (indiceAtual === -1 || this.mensagens[indiceAtual].texto !== '' || this.mensagens[indiceAtual].ferramenta) {
+              novaBolha();
+            }
+          } else if (evento.tipo === 'texto_delta') {
+            this.digitando = false;
+            garantirBolha();
+            this.mensagens[indiceAtual].texto += evento.valor;
+          } else if (evento.tipo === 'ferramenta') {
+            this.digitando = false;
+            if (indiceAtual === -1 || this.mensagens[indiceAtual].texto !== '') {
+              novaBolha();
+            }
+            this.mensagens[indiceAtual].ferramenta = evento.valor;
+          } else if (evento.tipo === 'erro') {
+            this.digitando = false;
+            this.pushMensagem('sistema', 'Ops, deu erro: ' + evento.valor);
+          }
+          this.scrollParaFim();
+        }
+      }
+    },
+
+    async enviar() {
+      const texto = this.entrada.trim();
+      if (!texto || this.enviando) return;
+
+      this.pushMensagem('usuario', texto);
+      this.entrada = '';
+      this.enviando = true;
+      this.digitando = true;
+      this.scrollParaFim();
+
+      try {
+        if (this.modo === 'ajuda') {
+          await this.enviarAjuda(texto);
+        } else {
+          await this.enviarChamado(texto);
+        }
+      } catch (e) {
+        this.pushMensagem('sistema', 'Não consegui falar com o servidor agora. Tenta de novo.');
+      } finally {
+        this.enviando = false;
+        this.digitando = false;
+        this.mensagens = this.mensagens.filter(m => {
+          if (['usuario', 'assistente', 'suporte', 'sistema'].includes(m.tipo)) {
+            return m.texto || m.ferramenta;
+          }
+          return true;
+        });
+        this.focoInicial();
+      }
+    },
+  };
+}
+</script>
+{% endblock %}

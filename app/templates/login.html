@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block conteudo %}
+<div class="pagina">
+  <div class="cartao">
+    <img class="logo" src="/static/img/logo-cedep.png" alt="CEDEP">
+    <h1>Suporte de TI</h1>
+    <p class="subtitulo">Entra com o mesmo usuário e senha que você usa no computador.</p>
+    <div id="area-login">
+      {% include "_form_login.html" %}
+    </div>
+  </div>
+</div>
+{% endblock %}
