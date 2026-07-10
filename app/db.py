@@ -75,6 +75,16 @@ def inicializar_banco() -> None:
             )
             """
         )
+        conexao.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chamados_vistos_tecnico (
+                ticket_id INTEGER NOT NULL,
+                tecnico_id INTEGER NOT NULL,
+                visto_em TEXT NOT NULL,
+                PRIMARY KEY (ticket_id, tecnico_id)
+            )
+            """
+        )
         _migrar_tabela_chamados_antiga(conexao)
         _migrar_coluna_papel_sessoes(conexao)
         _migrar_coluna_criado_pelo_bot(conexao)
@@ -318,3 +328,30 @@ def autores_tecnico_followups(ticket_id: int) -> dict[int, str]:
             (ticket_id,),
         ).fetchall()
         return {linha["followup_id"]: linha["tecnico_nome"] for linha in linhas}
+
+
+def marcar_chamado_visto_tecnico(ticket_id: int, tecnico_id: int) -> None:
+    """Quando ESSE tecnico abre a thread - usado pra saber se tem mensagem
+    nova do colaborador desde a ultima vez que ele olhou (bolinha de
+    notificacao no card de 'Em atendimento' do painel)."""
+    with conectar() as conexao:
+        conexao.execute(
+            "INSERT OR REPLACE INTO chamados_vistos_tecnico (ticket_id, tecnico_id, visto_em) "
+            "VALUES (?, ?, ?)",
+            (ticket_id, tecnico_id, _agora()),
+        )
+
+
+def obter_vistos_tecnico(tecnico_id: int, ticket_ids: list[int]) -> dict[int, str]:
+    """Em lote (nao 1 query por card) - visto_em de cada ticket pra esse
+    tecnico, so os que ele ja abriu alguma vez (ausentes = nunca viu)."""
+    if not ticket_ids:
+        return {}
+    with conectar() as conexao:
+        marcadores = ",".join("?" * len(ticket_ids))
+        linhas = conexao.execute(
+            f"SELECT ticket_id, visto_em FROM chamados_vistos_tecnico "
+            f"WHERE tecnico_id = ? AND ticket_id IN ({marcadores})",
+            [tecnico_id, *ticket_ids],
+        ).fetchall()
+        return {linha["ticket_id"]: linha["visto_em"] for linha in linhas}

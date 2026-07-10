@@ -32,6 +32,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    flex-wrap: wrap;
     margin: 0 0 12px;
     font: 700 13.5px 'Inter', sans-serif;
     color: var(--texto-forte);
@@ -43,6 +44,29 @@
     border: 1px solid var(--borda);
     border-radius: 20px;
     padding: 1px 8px;
+  }
+  .filtros-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-left: auto;
+  }
+  .filtro-status-botao {
+    font: 600 11px 'Inter', sans-serif;
+    color: var(--texto-fraco);
+    background: var(--superficie);
+    border: 1px solid var(--borda);
+    border-radius: 20px;
+    padding: 5px 11px;
+    cursor: pointer;
+    transition: border-color .15s, background .15s, color .15s;
+  }
+  .filtro-status-botao:hover { border-color: var(--borda-forte); color: var(--texto); }
+  .filtro-status-botao.ativo {
+    background: var(--azul-gradiente);
+    border-color: transparent;
+    color: #fff;
   }
 
   .lista-chamados { display: flex; flex-direction: column; gap: 12px; }
@@ -85,6 +109,21 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .item-chamado-preview {
+    font: 400 12px 'Inter', sans-serif;
+    color: var(--texto-suave);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .badge-nao-lida {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--azul);
+    box-shadow: 0 0 0 3px rgba(76,141,255,.2);
+    flex-shrink: 0;
+  }
   .item-chamado-status {
     display: inline-flex;
     align-items: center;
@@ -101,6 +140,7 @@
   }
   .item-chamado-status.status-aguardando { color: var(--status-aguardando-texto); }
   .item-chamado-status.status-atendimento { color: var(--status-atendimento-texto); }
+  .item-chamado-status.status-pendente { color: var(--status-aguardando-texto); }
   .item-chamado-status.status-resolvido { color: var(--status-resolvido-texto); }
   .item-chamado-status.status-fechado { color: var(--status-fechado-texto); }
 
@@ -131,7 +171,7 @@
 </style>
 {% endblock %}
 {% block conteudo %}
-<div class="pagina-hub" x-data="painelTecnico({{ fila_json }}, {{ atribuidos_json }})" x-init="iniciarStream()">
+<div class="pagina-hub" x-data="painelTecnico({{ fila_json }}, {{ atribuidos_json }}, {{ contagens_json }})" x-init="iniciarStream()">
   <div class="janela-hub">
     <div class="cabecalho-hub">
       <img class="logo" src="/static/img/logo-cedep.png" alt="CEDEP">
@@ -185,9 +225,18 @@
     </section>
 
     <section>
-      <h2 class="secao-titulo">Meus atendimentos <span class="contagem" x-text="atribuidos.length"></span></h2>
+      <h2 class="secao-titulo">
+        Meus atendimentos <span class="contagem" x-text="totalAtendimentos()"></span>
+        <div class="filtros-status">
+          <template x-for="opcao in filtrosAtendimento" :key="opcao.grupo">
+            <button type="button" class="filtro-status-botao" :class="{ativo: filtroAtendimento === opcao.grupo}"
+                    @click="selecionarFiltro(opcao.grupo)"
+                    x-text="opcao.rotulo + ' (' + contarPorGrupo(opcao.grupo) + ')'"></button>
+          </template>
+        </div>
+      </h2>
       <div class="lista-chamados">
-        <template x-for="c in atribuidos" :key="c.id">
+        <template x-for="c in atendimentosFiltrados()" :key="c.id">
           <div class="item-chamado-tecnico">
             <a class="item-chamado-link" :href="'/tecnico/chamados/' + c.id">
               <div class="item-chamado-linha1">
@@ -205,11 +254,14 @@
                 </span>
               </div>
               <span class="item-chamado-meta" x-text="(c.categoria || 'Sem categoria') + ' · ' + c.requerente_nome"></span>
+              <span class="item-chamado-preview" x-show="c.preview_texto" x-text="c.preview_texto"></span>
               <span class="item-chamado-status" :class="'status-' + c.status_classe" x-text="c.status_texto"></span>
             </a>
+            <span class="badge-nao-lida" x-show="c.nova_mensagem" title="Mensagem nova do colaborador"></span>
           </div>
         </template>
-        <p class="estado-vazio-hub" x-show="atribuidos.length === 0">Você ainda não assumiu nenhum chamado.</p>
+        <p class="estado-vazio-hub" x-show="carregandoGrupo">Carregando...</p>
+        <p class="estado-vazio-hub" x-show="!carregandoGrupo && atendimentosFiltrados().length === 0">Nenhum chamado nesse status.</p>
       </div>
     </section>
 
@@ -218,11 +270,56 @@
 </div>
 
 <script>
-function painelTecnico(filaInicial, atribuidosInicial) {
+function painelTecnico(filaInicial, atribuidosInicial, contagensIniciais) {
   return {
     fila: filaInicial || [],
+    // so os ATIVOS (em atendimento/pendente) - solucionados/fechados sao
+    // a maior parte do historico e carregam sob demanda (carregarGrupo)
+    // quando o filtro e clicado, pra pagina abrir rapido.
     atribuidos: atribuidosInicial || [],
+    contagens: contagensIniciais || {solucionado: 0, fechado: 0},
+    gruposCarregados: {},
+    carregandoGrupo: false,
     assumindo: null,
+
+    filtroAtendimento: 'atendimento',
+    filtrosAtendimento: [
+      {grupo: 'atendimento', rotulo: 'Em atendimento'},
+      {grupo: 'pendente', rotulo: 'Pendente'},
+      {grupo: 'solucionado', rotulo: 'Solucionados'},
+      {grupo: 'fechado', rotulo: 'Fechados'},
+    ],
+
+    atendimentosFiltrados() {
+      if (this.filtroAtendimento === 'solucionado' || this.filtroAtendimento === 'fechado') {
+        return this.gruposCarregados[this.filtroAtendimento] || [];
+      }
+      return this.atribuidos.filter((c) => c.grupo_status === this.filtroAtendimento);
+    },
+
+    contarPorGrupo(grupo) {
+      if (grupo === 'solucionado' || grupo === 'fechado') return this.contagens[grupo] || 0;
+      return this.atribuidos.filter((c) => c.grupo_status === grupo).length;
+    },
+
+    totalAtendimentos() {
+      return this.atribuidos.length + (this.contagens.solucionado || 0) + (this.contagens.fechado || 0);
+    },
+
+    async selecionarFiltro(grupo) {
+      this.filtroAtendimento = grupo;
+      if ((grupo === 'solucionado' || grupo === 'fechado') && !this.gruposCarregados[grupo]) {
+        this.carregandoGrupo = true;
+        try {
+          const resp = await fetch('/tecnico/atendimentos/' + grupo);
+          this.gruposCarregados = {...this.gruposCarregados, [grupo]: await resp.json()};
+        } catch (e) {
+          // proximo clique tenta de novo
+        } finally {
+          this.carregandoGrupo = false;
+        }
+      }
+    },
 
     iniciarStream() {
       let recebeu = false;
@@ -232,6 +329,7 @@ function painelTecnico(filaInicial, atribuidosInicial) {
         const dados = JSON.parse(msg.data);
         this.fila = dados.fila;
         this.atribuidos = dados.atribuidos;
+        if (dados.contagens) this.contagens = dados.contagens;
       };
       fonte.onerror = () => {
         fonte.close();
@@ -246,6 +344,7 @@ function painelTecnico(filaInicial, atribuidosInicial) {
           const dados = await resp.json();
           this.fila = dados.fila;
           this.atribuidos = dados.atribuidos;
+          if (dados.contagens) this.contagens = dados.contagens;
         } catch (e) {
           // silencioso - tenta de novo no proximo ciclo
         }

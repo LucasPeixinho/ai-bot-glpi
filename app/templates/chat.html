@@ -625,7 +625,14 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
 
     statusPillTexto() {
       if (!this.statusAtual) return '';
-      return '#' + this.statusAtual.id + ' · ' + this.rotuloStatus(this.statusAtual.status);
+      let rotulo = this.rotuloStatus(this.statusAtual.status);
+      // o usuario precisa saber QUEM esta cuidando, nao so que esta "em
+      // atendimento" - nome so faz sentido nesses dois status (2/3), os
+      // demais (novo/pendente/resolvido/fechado) nao tem tecnico "atual".
+      if (this.statusAtual.tecnico && (this.statusAtual.status === 2 || this.statusAtual.status === 3)) {
+        rotulo += ' — ' + this.statusAtual.tecnico;
+      }
+      return '#' + this.statusAtual.id + ' · ' + rotulo;
     },
 
     ultimoTipoConversacional() {
@@ -687,9 +694,10 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
         this.pushMensagem('suporte', evento.texto, {autorNome: evento.autor});
       } else if (evento.tipo === 'tecnico_assumiu') {
         this.pushMensagem('tecnico_assumiu', '', {nome: evento.nome});
+        if (this.statusAtual) this.statusAtual = {...this.statusAtual, tecnico: evento.nome};
       } else if (evento.tipo === 'status') {
         this.pushMensagem('sistema', evento.texto);
-        if (this.statusAtual) this.statusAtual = {id: this.statusAtual.id, status: evento.status};
+        if (this.statusAtual) this.statusAtual = {...this.statusAtual, status: evento.status};
       } else if (evento.tipo === 'resolvido') {
         const novoStatus = evento.mostrarBotoes ? 5 : 6;
         // enviando/erro/mostrarFormRecusa/jaRespondido/motivoTexto

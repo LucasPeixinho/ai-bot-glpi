@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -99,26 +100,20 @@ async def buscar_usuario_por_login(login: str) -> dict | None:
 
     Retorna dict com id, login, primeiro_nome, sobrenome, nome_completo, ativo.
     """
-    async with httpx.AsyncClient(timeout=10.0) as cliente:
-        session_token = await _abrir_sessao(cliente)
-        try:
-            resp = await cliente.get(
-                f"{GLPI_URL}/apirest.php/search/User",
-                headers={"App-Token": GLPI_APP_TOKEN, "Session-Token": session_token},
-                params={
-                    "criteria[0][field]": CAMPO_LOGIN,
-                    "criteria[0][searchtype]": "contains",
-                    "criteria[0][value]": login,
-                    "forcedisplay[0]": CAMPO_ID,
-                    "forcedisplay[1]": CAMPO_LOGIN,
-                    "forcedisplay[2]": CAMPO_PRIMEIRO_NOME,
-                    "forcedisplay[3]": CAMPO_SOBRENOME,
-                    "forcedisplay[4]": CAMPO_ATIVO,
-                },
-            )
-        finally:
-            await _fechar_sessao(cliente, session_token)
-
+    resp = await _requisicao(
+        "GET",
+        "/search/User",
+        params={
+            "criteria[0][field]": CAMPO_LOGIN,
+            "criteria[0][searchtype]": "contains",
+            "criteria[0][value]": login,
+            "forcedisplay[0]": CAMPO_ID,
+            "forcedisplay[1]": CAMPO_LOGIN,
+            "forcedisplay[2]": CAMPO_PRIMEIRO_NOME,
+            "forcedisplay[3]": CAMPO_SOBRENOME,
+            "forcedisplay[4]": CAMPO_ATIVO,
+        },
+    )
     resp.raise_for_status()
     corpo = resp.json()
 
@@ -151,26 +146,63 @@ def _texto_simples(bruto: str) -> str:
     return texto.strip()
 
 
+# Cliente HTTP compartilhado (keep-alive/pool de conexao TCP) - NAO
+# confundir com a sessao do GLPI, que continua uma por chamada: o GLPI
+# serializa chamadas concorrentes que usam o MESMO session-token (testado
+# ao vivo: 20 chamadas com o mesmo token = ~4s; com tokens diferentes =
+# 0.2s - bate com o lock de arquivo de sessao do PHP). Aqui e so a camada
+# TCP/HTTP que e reaproveitada, o que e seguro e corta o handshake de
+# conexao por requisicao.
+_CLIENTE_HTTP: httpx.AsyncClient | None = None
+
+
+def _cliente_http() -> httpx.AsyncClient:
+    global _CLIENTE_HTTP
+    if _CLIENTE_HTTP is None:
+        _CLIENTE_HTTP = httpx.AsyncClient(timeout=10.0)
+    return _CLIENTE_HTTP
+
+
 async def _requisicao(metodo: str, caminho: str, **kwargs) -> httpx.Response:
-    """Abre sessao GLPI, faz 1 requisicao, fecha sessao. Uso pontual (polling
-    de baixa frequencia) - nao serve pra rajadas de chamadas."""
-    async with httpx.AsyncClient(timeout=10.0) as cliente:
-        session_token = await _abrir_sessao(cliente)
-        headers = kwargs.pop("headers", {})
-        headers["App-Token"] = GLPI_APP_TOKEN
-        headers["Session-Token"] = session_token
-        try:
-            resp = await cliente.request(
-                metodo, f"{GLPI_URL}/apirest.php{caminho}", headers=headers, **kwargs
-            )
-        finally:
-            await _fechar_sessao(cliente, session_token)
+    """Abre sessao GLPI, faz 1 requisicao, fecha sessao (sessao POR
+    chamada de proposito - ver comentario de _cliente_http). O custo de
+    abrir/fechar (~60ms) so aparece em cadeias sequenciais - os chamadores
+    quentes paralelizam com asyncio.gather, entao vira custo unico."""
+    cliente = _cliente_http()
+    session_token = await _abrir_sessao(cliente)
+    headers = kwargs.pop("headers", {})
+    headers["App-Token"] = GLPI_APP_TOKEN
+    headers["Session-Token"] = session_token
+    try:
+        resp = await cliente.request(
+            metodo, f"{GLPI_URL}/apirest.php{caminho}", headers=headers, **kwargs
+        )
+    finally:
+        await _fechar_sessao(cliente, session_token)
     return resp
+
+
+# Cache de nomes de usuario: o mesmo tecnico/requerente e re-resolvido a
+# cada tick de SSE/polling (a cada poucos segundos, pra sempre o mesmo
+# resultado) - nome de usuario praticamente nao muda, entao 10min de TTL
+# elimina a maior parte dessas chamadas sem risco pratico de nome velho.
+_CACHE_NOMES: dict[int, tuple[float, dict | None]] = {}
+_TTL_CACHE_NOMES_SEGUNDOS = 600
+
+
+def _cache_nome_valido(usuario_id: int) -> tuple[bool, dict | None]:
+    entrada = _CACHE_NOMES.get(usuario_id)
+    if entrada and (time.monotonic() - entrada[0]) < _TTL_CACHE_NOMES_SEGUNDOS:
+        return True, entrada[1]
+    return False, None
 
 
 async def obter_usuario_por_id(usuario_id: int) -> dict | None:
     """Resolve nome de exibicao de um usuario pelo ID (usado pra rotular
-    followups do tecnico: 'Suporte - Fulano: ...')."""
+    followups do tecnico: 'Suporte - Fulano: ...'). Com cache (TTL)."""
+    em_cache, valor = _cache_nome_valido(usuario_id)
+    if em_cache:
+        return valor
     resp = await _requisicao(
         "GET",
         "/search/User",
@@ -185,6 +217,7 @@ async def obter_usuario_por_id(usuario_id: int) -> dict | None:
     resp.raise_for_status()
     linhas = resp.json().get("data") or []
     if not linhas:
+        _CACHE_NOMES[usuario_id] = (time.monotonic(), None)
         return None
     linha = linhas[0]
     primeiro_nome = linha.get(str(CAMPO_PRIMEIRO_NOME)) or ""
@@ -192,7 +225,9 @@ async def obter_usuario_por_id(usuario_id: int) -> dict | None:
     # fallback apresentavel (nunca "usuario 123" vazando ID interno pra
     # tela) pra conta de servico/tecnico sem nome cadastrado no GLPI.
     nome_completo = f"{primeiro_nome} {sobrenome}".strip() or "Suporte de TI"
-    return {"id": usuario_id, "nome_completo": nome_completo}
+    resultado = {"id": usuario_id, "nome_completo": nome_completo}
+    _CACHE_NOMES[usuario_id] = (time.monotonic(), resultado)
+    return resultado
 
 
 async def listar_followups_publicos(ticket_id: int) -> list[dict]:
@@ -451,15 +486,27 @@ async def buscar_chamados_abertos_usuario(usuario_id: int) -> list[dict]:
 async def _resolver_nomes_usuarios(usuario_ids: set[int]) -> dict[int, str]:
     """Resolve o nome de varios usuarios de uma vez (1 busca agrupada em vez
     de 1 chamada por requerente) - usado pra montar a coluna 'requerente' da
-    Fila/Meus atendimentos sem rajada de chamadas em /Ticket_User."""
-    if not usuario_ids:
-        return {}
+    Fila/Meus atendimentos sem rajada de chamadas em /Ticket_User. Usa e
+    alimenta o mesmo _CACHE_NOMES de obter_usuario_por_id, entao nos ticks
+    seguintes do SSE a busca costuma nem sair pro GLPI."""
+    nomes: dict[int, str] = {}
+    faltantes: set[int] = set()
+    for usuario_id in usuario_ids:
+        em_cache, valor = _cache_nome_valido(usuario_id)
+        if em_cache:
+            if valor:
+                nomes[usuario_id] = valor["nome_completo"]
+            continue
+        faltantes.add(usuario_id)
+    if not faltantes:
+        return nomes
+
     params = {
         "forcedisplay[0]": CAMPO_ID,
         "forcedisplay[1]": CAMPO_PRIMEIRO_NOME,
         "forcedisplay[2]": CAMPO_SOBRENOME,
     }
-    for indice, usuario_id in enumerate(usuario_ids):
+    for indice, usuario_id in enumerate(faltantes):
         prefixo = f"criteria[{indice}]"
         if indice:
             params[f"{prefixo}[link]"] = "OR"
@@ -469,12 +516,14 @@ async def _resolver_nomes_usuarios(usuario_ids: set[int]) -> dict[int, str]:
     resp = await _requisicao("GET", "/search/User", params=params)
     resp.raise_for_status()
     linhas = resp.json().get("data") or []
-    nomes = {}
+    agora = time.monotonic()
     for linha in linhas:
         usuario_id = int(linha[str(CAMPO_ID)])
         primeiro_nome = linha.get(str(CAMPO_PRIMEIRO_NOME)) or ""
         sobrenome = linha.get(str(CAMPO_SOBRENOME)) or ""
-        nomes[usuario_id] = f"{primeiro_nome} {sobrenome}".strip() or "Suporte de TI"
+        nome = f"{primeiro_nome} {sobrenome}".strip() or "Suporte de TI"
+        nomes[usuario_id] = nome
+        _CACHE_NOMES[usuario_id] = (agora, {"id": usuario_id, "nome_completo": nome})
     return nomes
 
 
@@ -494,7 +543,7 @@ def _montar_criterio_status_aberto(indice_pai: int) -> dict:
 
 
 async def _buscar_e_montar_lista(params: dict) -> list[dict]:
-    """Base comum de listar_fila/listar_atribuidos: dispara a busca, monta
+    """Base comum de listar_fila/listar_atribuidos_*: dispara a busca, monta
     os dicts em portugues e resolve os nomes dos requerentes em lote."""
     resp = await _requisicao("GET", "/search/Ticket", params=params)
     resp.raise_for_status()
@@ -539,17 +588,18 @@ async def listar_fila() -> list[dict]:
         "forcedisplay[5]": CAMPO_TICKET_DATA_ABERTURA,
         "sort": CAMPO_TICKET_DATA_ABERTURA,
         "order": "ASC",
-        "range": "0-99",
+        # 0-499: testado ao vivo, o GLPI aceita esse range numa unica
+        # busca sem paginar (o limite de configuracao default costuma
+        # ser 500) - 0-99 truncava silenciosamente tecnicos com mais de
+        # 100 chamados no historico (ver listar_atribuidos_ativos).
+        "range": "0-499",
     }
     params.update(_montar_criterio_status_aberto(1))
     return await _buscar_e_montar_lista(params)
 
 
-async def listar_atribuidos(tecnico_id: int) -> list[dict]:
-    """Chamados atribuidos a esse tecnico, exceto fechados (fechado = fora
-    do trabalho ativo, igual a logica de 'ativos' do hub do colaborador) -
-    'Meus atendimentos' do painel. Mais recente atualizado primeiro."""
-    params = {
+def _params_atribuidos(tecnico_id: int) -> dict:
+    return {
         "criteria[0][field]": CAMPO_TICKET_TECNICO,
         "criteria[0][searchtype]": "equals",
         "criteria[0][value]": tecnico_id,
@@ -561,7 +611,54 @@ async def listar_atribuidos(tecnico_id: int) -> list[dict]:
         "forcedisplay[5]": CAMPO_TICKET_DATA_ABERTURA,
         "sort": CAMPO_TICKET_DATA_MOD,
         "order": "DESC",
-        "range": "0-99",
+        # 0-99 truncava tecnicos com historico grande (confirmado ao
+        # vivo: um tecnico de teste tinha 168 atribuidos, 68 ficavam fora).
+        "range": "0-499",
     }
-    chamados = await _buscar_e_montar_lista(params)
-    return [c for c in chamados if c["status"] != STATUS_FECHADO]
+
+
+async def listar_atribuidos_ativos(tecnico_id: int) -> list[dict]:
+    """So os chamados ATIVOS (status 1-4) atribuidos a esse tecnico - o
+    carregamento padrao de 'Meus atendimentos'. Solucionados/fechados sao
+    a maior parte do historico e o GLPI cobra ~7ms por linha hidratada
+    (medido ao vivo: 169 linhas = 1.3s POR TICK de SSE), entao eles ficam
+    de fora daqui e so carregam sob demanda (listar_atribuidos_por_status)
+    quando o tecnico clica no filtro."""
+    params = _params_atribuidos(tecnico_id)
+    params.update(_montar_criterio_status_aberto(1))
+    return await _buscar_e_montar_lista(params)
+
+
+async def listar_atribuidos_por_status(tecnico_id: int, status: int) -> list[dict]:
+    """Chamados atribuidos a esse tecnico num status especifico (5=
+    solucionado, 6=fechado) - carregamento sob demanda do filtro do
+    painel (ver listar_atribuidos_ativos)."""
+    params = _params_atribuidos(tecnico_id)
+    params["criteria[1][link]"] = "AND"
+    params["criteria[1][field]"] = CAMPO_TICKET_STATUS
+    params["criteria[1][searchtype]"] = "equals"
+    params["criteria[1][value]"] = status
+    return await _buscar_e_montar_lista(params)
+
+
+async def contar_atribuidos_por_status(tecnico_id: int, status: int) -> int:
+    """So a CONTAGEM (range 0-0, GLPI devolve totalcount sem hidratar
+    linha nenhuma - 0.16s contra 1.3s da lista completa) - pros numeros
+    nos botoes de filtro do painel sem pagar a lista inteira."""
+    resp = await _requisicao(
+        "GET",
+        "/search/Ticket",
+        params={
+            "criteria[0][field]": CAMPO_TICKET_TECNICO,
+            "criteria[0][searchtype]": "equals",
+            "criteria[0][value]": tecnico_id,
+            "criteria[1][link]": "AND",
+            "criteria[1][field]": CAMPO_TICKET_STATUS,
+            "criteria[1][searchtype]": "equals",
+            "criteria[1][value]": status,
+            "forcedisplay[0]": CAMPO_TICKET_ID,
+            "range": "0-0",
+        },
+    )
+    resp.raise_for_status()
+    return int(resp.json().get("totalcount") or 0)

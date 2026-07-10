@@ -48,8 +48,10 @@ from app.glpi import (
     buscar_todos_chamados_usuario,
     criar_followup_privado,
     criar_followup_publico,
+    contar_atribuidos_por_status,
     criar_solucao,
-    listar_atribuidos,
+    listar_atribuidos_ativos,
+    listar_atribuidos_por_status,
     listar_fila,
     listar_followups_publicos,
     listar_timeline_completa,
@@ -319,36 +321,52 @@ async def _computar_ativos(usuario_id: int) -> list[dict]:
     todos = await buscar_todos_chamados_usuario(usuario_id)
     ativos_brutos = [c for c in todos if c["status"] != STATUS_FECHADO]
 
-    ativos = []
-    for chamado in ativos_brutos:
+    async def _montar_item(chamado: dict) -> dict | None:
         await relay.garantir_estado_chamado(usuario_id, chamado["id"])
         estado_db = db.obter_estado_chamado(chamado["id"])
 
         # verificacao oportunista "na carga da sessao" (Fase 4, alem da
         # varredura horaria): se abrir o hub ja acha o chamado vencido,
-        # fecha na hora em vez de esperar o proximo ciclo da hora.
-        if estado_db and await relay.fechar_se_vencido(chamado["id"], estado_db):
-            continue
+        # fecha na hora em vez de esperar o proximo ciclo da hora. So faz
+        # sentido quando o status AO VIVO (da busca de agora ha pouco) e
+        # resolvido - antes isso chamava obter_chamado_completo pra TODO
+        # chamado do bot em TODO tick do SSE, so pra descobrir que nao
+        # tinha nada resolvido pra fechar.
+        if (
+            chamado["status"] == STATUS_RESOLVIDO
+            and estado_db
+            and await relay.fechar_se_vencido(chamado["id"], estado_db)
+        ):
+            return None
 
-        atribuido = False
+        tecnico_nome = None
         if chamado["status"] not in STATUS_RESOLVIDO_OU_FECHADO:
-            atribuido = bool(await obter_tecnico_atribuido(chamado["id"]))
+            tecnico_nome = await obter_tecnico_atribuido(chamado["id"])
         nao_lida = bool(
             estado_db
             and estado_db["visto_em"]
             and estado_db["atualizado_em"] > estado_db["visto_em"]
         )
-        status_texto, status_classe = _status_humano(chamado["status"], atribuido)
-        ativos.append(
-            {
-                "id": chamado["id"],
-                "titulo": chamado["titulo"],
-                "status_texto": status_texto,
-                "status_classe": status_classe,
-                "nao_lida": nao_lida,
-            }
-        )
-    return ativos
+        status_texto, status_classe = _status_humano(chamado["status"], bool(tecnico_nome))
+        if tecnico_nome and status_classe == "atendimento":
+            # o colaborador precisa saber QUEM esta cuidando do chamado,
+            # nao so que "alguem" esta - _status_humano fica generico de
+            # proposito (reusado pelo painel do tecnico, onde o nome nao
+            # faz sentido), entao o nome entra aqui.
+            status_texto = f"Em atendimento — {tecnico_nome}"
+        return {
+            "id": chamado["id"],
+            "titulo": chamado["titulo"],
+            "status_texto": status_texto,
+            "status_classe": status_classe,
+            "nao_lida": nao_lida,
+        }
+
+    # um item por vez era o que deixava a troca de pagina lenta: cada
+    # chamado custa 1-2 idas ao GLPI (~0.2s cada) e elas nao dependem uma
+    # da outra - gather preserva a ordem da lista.
+    itens = await asyncio.gather(*[_montar_item(c) for c in ativos_brutos])
+    return [item for item in itens if item is not None]
 
 
 @app.get("/chamados", response_class=HTMLResponse)
@@ -614,14 +632,28 @@ async def pagina_chamado(request: Request, ticket_id: int):
         return RedirectResponse("/", status_code=303)
 
     usuario = sessao["usuario"]
-    if not await _autorizar_chamado(usuario["id"], ticket_id):
+
+    # autorizacao + dados em paralelo (eram 3 idas sequenciais ao GLPI,
+    # ~0.2s cada): sao todas leituras, entao buscar os dados junto com o
+    # check de autorizacao nao vaza nada - se nao autorizado, descarta e
+    # redireciona sem usar. return_exceptions pra um 404 de ticket
+    # inexistente nao virar 500 antes do check de autorizacao (que ja
+    # barra ticket inexistente, pois ele nunca esta na lista do usuario).
+    autorizado, resumo, followups = await asyncio.gather(
+        _autorizar_chamado(usuario["id"], ticket_id),
+        obter_chamado_completo(ticket_id),
+        listar_followups_publicos(ticket_id),
+        return_exceptions=True,
+    )
+    if isinstance(autorizado, BaseException) or not autorizado:
         return RedirectResponse("/chamados", status_code=303)
+    if isinstance(resumo, BaseException):
+        raise resumo
+    if isinstance(followups, BaseException):
+        raise followups
 
     await relay.garantir_estado_chamado(usuario["id"], ticket_id)
     db.marcar_chamado_visto(ticket_id)
-
-    resumo = await obter_chamado_completo(ticket_id)
-    followups = await listar_followups_publicos(ticket_id)
     ids_usuario = db.followups_do_usuario(ticket_id)
 
     mensagens: list[dict] = [
@@ -644,7 +676,17 @@ async def pagina_chamado(request: Request, ticket_id: int):
         )
         ultimo_tipo_conversacional = "assistente"
 
-    nomes_cache: dict[int, str] = {}
+    # resolve os nomes dos autores de uma vez (em paralelo) em vez de um
+    # por um dentro do loop - obter_usuario_por_id ja tem cache, entao na
+    # pratica so a primeira visita de cada autor sai pro GLPI.
+    uids_autores = {
+        f["users_id"] for f in followups if f["id"] not in ids_usuario
+    }
+    autores = await asyncio.gather(*[obter_usuario_por_id(uid) for uid in uids_autores])
+    nomes_cache: dict[int, str] = {
+        uid: (autor["nome_completo"] if autor else "Suporte")
+        for uid, autor in zip(uids_autores, autores)
+    }
     tem_followup_tecnico = False
     for followup in followups:
         hora = _formatar_hora(followup["data"])
@@ -664,15 +706,11 @@ async def pagina_chamado(request: Request, ticket_id: int):
             ultimo_tipo_conversacional = "usuario"
             continue
         tem_followup_tecnico = True
-        uid = followup["users_id"]
-        if uid not in nomes_cache:
-            autor = await obter_usuario_por_id(uid)
-            nomes_cache[uid] = autor["nome_completo"] if autor else "Suporte"
         mensagens.append(
             {
                 "tipo": "suporte",
                 "texto": followup["conteudo"],
-                "autorNome": nomes_cache[uid],
+                "autorNome": nomes_cache.get(followup["users_id"], "Suporte"),
                 "mostrarRotulo": ultimo_tipo_conversacional != "suporte",
                 "hora": hora,
             }
@@ -729,7 +767,11 @@ async def pagina_chamado(request: Request, ticket_id: int):
             modo_acompanhamento=bool(estado_db["modo_acompanhamento"]) or tem_followup_tecnico,
         )
 
-    chamado_info = {"id": ticket_id, "status": resumo["status"]}
+    tecnico_nome = None
+    if resumo["status"] not in STATUS_RESOLVIDO_OU_FECHADO:
+        tecnico_nome = await obter_tecnico_atribuido(ticket_id)
+
+    chamado_info = {"id": ticket_id, "status": resumo["status"], "tecnico": tecnico_nome}
     return templates.TemplateResponse(
         request,
         "chat.html",
@@ -961,37 +1003,125 @@ async def recusar_solucao_chamado(request: Request, ticket_id: int, motivo: str 
 # atendimentos, nao e uma trava de permissao.
 # ---------------------------------------------------------------------------
 
-INTERVALO_SSE_TECNICO_SEGUNDOS = 3
+INTERVALO_SSE_TECNICO_SEGUNDOS = 6
+
+
+STATUS_PENDENTE = 4  # GLPI: pendente (ver comentario de STATUS_ABERTOS em glpi.py)
+
+
+def _grupo_status_tecnico(status: int) -> str:
+    """Agrupamento pros botoes de filtro de 'Meus atendimentos' (painel do
+    tecnico) - diferente de _status_humano (que so tem 'atendimento' pra
+    tudo que nao e resolvido/fechado): aqui pendente vira grupo proprio,
+    senao a lista de atendimentos fica gigante e misturada."""
+    if status == STATUS_FECHADO:
+        return "fechado"
+    if status == STATUS_RESOLVIDO:
+        return "solucionado"
+    if status == STATUS_PENDENTE:
+        return "pendente"
+    return "atendimento"
+
+
+async def _obter_preview_mensagem_usuario(ticket_id: int) -> tuple[str | None, str | None]:
+    """(texto, data) da ULTIMA mensagem do colaborador nesse chamado - pro
+    preview + notificacao dos cards de 'Em atendimento' do painel do
+    tecnico. (None, None) se o colaborador ainda nao mandou nada."""
+    followups = await listar_followups_publicos(ticket_id)
+    ids_usuario = db.followups_do_usuario(ticket_id)
+    mensagens_usuario = [f for f in followups if f["id"] in ids_usuario]
+    if not mensagens_usuario:
+        return None, None
+    ultima = mensagens_usuario[-1]
+    texto = ultima["conteudo"].replace("\n", " ").strip()
+    if len(texto) > 120:
+        texto = texto[:120].rstrip() + "…"
+    return texto, ultima["data"]
+
+
+def _mensagem_e_nova(data_mensagem: str | None, visto_em: str | None) -> bool:
+    """`data_mensagem` vem do GLPI ('YYYY-MM-DD HH:MM:SS'), `visto_em` vem
+    do nosso banco (ISO, de _agora()) - formatos diferentes, por isso
+    parseia os dois em vez de comparar string com string."""
+    if not data_mensagem:
+        return False
+    if not visto_em:
+        return True
+    momento_msg = datetime.strptime(data_mensagem, "%Y-%m-%d %H:%M:%S")
+    momento_visto = datetime.fromisoformat(visto_em)
+    return momento_msg > momento_visto
+
+
+def _decorar_chamados_tecnico(chamados: list[dict], atribuido: bool) -> list[dict]:
+    """Decoracao comum dos cards do painel do tecnico (status humano,
+    grupo de filtro, icone 'via assistente')."""
+    bot_ids = db.chamados_criados_pelo_bot([c["id"] for c in chamados])
+    decorados = []
+    for c in chamados:
+        grupo_status = _grupo_status_tecnico(c["status"])
+        status_texto, status_classe = _status_humano(c["status"], atribuido)
+        if atribuido and grupo_status == "pendente":
+            # _status_humano nao distingue pendente de "em atendimento"
+            # (o colaborador ve os dois como a mesma coisa, de
+            # proposito) - mas o painel do tecnico precisa, senao o
+            # filtro "Pendente" mostra cards escritos "Em atendimento".
+            status_texto, status_classe = "Pendente", "pendente"
+        decorados.append(
+            {
+                "id": c["id"],
+                "titulo": c["titulo"],
+                "categoria": c["categoria"],
+                "requerente_nome": c["requerente_nome"],
+                "data_abertura": c["data_abertura"],
+                "status_texto": status_texto,
+                "status_classe": status_classe,
+                "grupo_status": grupo_status,
+                "via_bot": c["id"] in bot_ids,
+                # preenchidos so pros cards de "Em atendimento" - default
+                # neutro nos outros, pra nunca depender do Alpine criar
+                # essas chaves na hora.
+                "preview_texto": None,
+                "nova_mensagem": False,
+            }
+        )
+    return decorados
 
 
 async def _computar_painel_tecnico(tecnico_id: int) -> dict:
     """Fila (chamados sem tecnico, status aberto) + Meus atendimentos
-    (atribuidos a este tecnico, exceto fechados), com status humano e
-    icone 'via assistente' - usado tanto no carregamento normal quanto no
-    SSE (/tecnico/stream), mesmo padrao de _computar_ativos."""
-    fila = await listar_fila()
-    atribuidos = await listar_atribuidos(tecnico_id)
-    bot_ids = db.chamados_criados_pelo_bot([c["id"] for c in fila] + [c["id"] for c in atribuidos])
+    ATIVOS (em atendimento/pendente) + contagens de solucionados/fechados.
+    Solucionados/fechados NAO vem hidratados aqui de proposito - sao a
+    maior parte do historico e o GLPI cobra ~7ms/linha (169 linhas = 1.3s
+    por tick de SSE, medido ao vivo); eles carregam sob demanda em
+    /tecnico/atendimentos/{grupo} quando o filtro e clicado, e os botoes
+    mostram a contagem barata (range 0-0)."""
+    fila, atribuidos, total_solucionados, total_fechados = await asyncio.gather(
+        listar_fila(),
+        listar_atribuidos_ativos(tecnico_id),
+        contar_atribuidos_por_status(tecnico_id, STATUS_RESOLVIDO),
+        contar_atribuidos_por_status(tecnico_id, STATUS_FECHADO),
+    )
 
-    def _decorar(chamados: list[dict], atribuido: bool) -> list[dict]:
-        decorados = []
-        for c in chamados:
-            status_texto, status_classe = _status_humano(c["status"], atribuido)
-            decorados.append(
-                {
-                    "id": c["id"],
-                    "titulo": c["titulo"],
-                    "categoria": c["categoria"],
-                    "requerente_nome": c["requerente_nome"],
-                    "data_abertura": c["data_abertura"],
-                    "status_texto": status_texto,
-                    "status_classe": status_classe,
-                    "via_bot": c["id"] in bot_ids,
-                }
-            )
-        return decorados
+    fila_decorada = _decorar_chamados_tecnico(fila, atribuido=False)
+    atribuidos_decorados = _decorar_chamados_tecnico(atribuidos, atribuido=True)
 
-    return {"fila": _decorar(fila, atribuido=False), "atribuidos": _decorar(atribuidos, atribuido=True)}
+    # Preview da ultima mensagem do colaborador + bolinha de "mensagem
+    # nova" - so pros chamados "Em atendimento" (grupo pequeno e ativo).
+    em_atendimento = [c for c in atribuidos_decorados if c["grupo_status"] == "atendimento"]
+    if em_atendimento:
+        previews = await asyncio.gather(
+            *[_obter_preview_mensagem_usuario(c["id"]) for c in em_atendimento]
+        )
+        vistos = db.obter_vistos_tecnico(tecnico_id, [c["id"] for c in em_atendimento])
+        for c, (texto, data) in zip(em_atendimento, previews):
+            c["preview_texto"] = texto
+            c["nova_mensagem"] = _mensagem_e_nova(data, vistos.get(c["id"]))
+
+    return {
+        "fila": fila_decorada,
+        "atribuidos": atribuidos_decorados,
+        "contagens": {"solucionado": total_solucionados, "fechado": total_fechados},
+    }
 
 
 @app.get("/tecnico", response_class=HTMLResponse)
@@ -1009,6 +1139,7 @@ async def painel_tecnico(request: Request):
             "usuario": usuario,
             "fila_json": json.dumps(painel["fila"], ensure_ascii=False),
             "atribuidos_json": json.dumps(painel["atribuidos"], ensure_ascii=False),
+            "contagens_json": json.dumps(painel["contagens"], ensure_ascii=False),
         },
     )
 
@@ -1025,6 +1156,24 @@ async def resumo_tecnico(request: Request):
     if not _exigir_tecnico(sessao):
         return JSONResponse({"fila": [], "atribuidos": []})
     return JSONResponse(await _computar_painel_tecnico(sessao["usuario"]["id"]))
+
+
+GRUPOS_SOB_DEMANDA = {"solucionado": STATUS_RESOLVIDO, "fechado": STATUS_FECHADO}
+
+
+@app.get("/tecnico/atendimentos/{grupo}")
+async def tecnico_atendimentos_grupo(request: Request, grupo: str):
+    """Carregamento sob demanda dos filtros 'Solucionados'/'Fechados' do
+    painel - essas listas sao a maior parte do historico do tecnico e nao
+    entram no carregamento padrao nem no SSE (ver _computar_painel_tecnico)."""
+    sessao = _sessao_ativa(request)
+    if not _exigir_tecnico(sessao):
+        return JSONResponse([], status_code=403)
+    status = GRUPOS_SOB_DEMANDA.get(grupo)
+    if status is None:
+        return JSONResponse([], status_code=404)
+    chamados = await listar_atribuidos_por_status(sessao["usuario"]["id"], status)
+    return JSONResponse(_decorar_chamados_tecnico(chamados, atribuido=True))
 
 
 @app.get("/tecnico/stream")
@@ -1063,8 +1212,9 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
     marcados em db.followups_do_usuario sao do proprio colaborador
     (relayados) - mesma logica de autoria de pagina_chamado, so que aqui o
     rotulo e 'colaborador' em vez de 'usuario'."""
-    resumo = await obter_chamado_completo(ticket_id)
-    timeline = await listar_timeline_completa(ticket_id)
+    resumo, timeline = await asyncio.gather(
+        obter_chamado_completo(ticket_id), listar_timeline_completa(ticket_id)
+    )
     ids_usuario = db.followups_do_usuario(ticket_id)
     autores_tecnico = db.autores_tecnico_followups(ticket_id)
 
@@ -1080,7 +1230,18 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
             }
         )
 
-    nomes_cache: dict[int, str] = {}
+    # nomes dos autores de uma vez, em paralelo (com cache) - antes era 1
+    # ida ao GLPI por autor, dentro do loop.
+    uids_autores = {
+        item["users_id"]
+        for item in timeline
+        if item["id"] not in ids_usuario and item["id"] not in autores_tecnico
+    }
+    autores = await asyncio.gather(*[obter_usuario_por_id(uid) for uid in uids_autores])
+    nomes_cache: dict[int, str] = {
+        uid: (autor["nome_completo"] if autor else "Suporte")
+        for uid, autor in zip(uids_autores, autores)
+    }
     for item in timeline:
         hora = _formatar_hora(item["data"])
         if item["id"] in ids_usuario:
@@ -1092,11 +1253,7 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
             # autor de toda escrita do app).
             autor_nome = autores_tecnico[item["id"]]
         else:
-            uid = item["users_id"]
-            if uid not in nomes_cache:
-                autor = await obter_usuario_por_id(uid)
-                nomes_cache[uid] = autor["nome_completo"] if autor else "Suporte"
-            autor_nome = nomes_cache[uid]
+            autor_nome = nomes_cache.get(item["users_id"], "Suporte")
         mensagens.append(
             {
                 "tipo": "tecnico",
@@ -1121,8 +1278,10 @@ async def tecnico_thread(request: Request, ticket_id: int):
     if not _exigir_tecnico(sessao):
         return RedirectResponse("/chamados", status_code=303)
 
-    resumo, mensagens = await _montar_timeline_tecnico(ticket_id)
-    tecnico_atribuido = await obter_tecnico_atribuido(ticket_id)
+    (resumo, mensagens), tecnico_atribuido = await asyncio.gather(
+        _montar_timeline_tecnico(ticket_id), obter_tecnico_atribuido(ticket_id)
+    )
+    db.marcar_chamado_visto_tecnico(ticket_id, sessao["usuario"]["id"])
 
     chamado_info = {"id": ticket_id, "status": resumo["status"], "titulo": resumo["titulo"]}
     return templates.TemplateResponse(
