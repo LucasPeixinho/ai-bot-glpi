@@ -1,0 +1,27 @@
+[Unit]
+Description=Chatbot GLPI - assistente de abertura de chamados via IA
+After=network.target
+
+[Service]
+Type=simple
+# TEMPORARIO: rodando como administrator pra reaproveitar o login pessoal do
+# Claude Code (~/.claude/) enquanto nao ha ANTHROPIC_API_KEY dedicada no .env.
+# Assim que a API key chegar: preencher ANTHROPIC_API_KEY no .env, trocar
+# User/Group abaixo para chatbot-glpi, rodar deploy/instalar.sh de novo e
+# reiniciar (systemctl restart chatbot-glpi). Ver deploy/instalar.sh.
+User=administrator
+Group=administrator
+WorkingDirectory=/opt/chatbot-glpi
+# nao precisa de EnvironmentFile: app/glpi.py e app/agente.py ja chamam
+# load_dotenv() com caminho absoluto pro .env do projeto
+ExecStart=/opt/chatbot-glpi/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8100
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
