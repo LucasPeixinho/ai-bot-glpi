@@ -6,6 +6,7 @@ Criacao/consulta de chamados continuam via MCP dentro do agente (agente.py).
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import time
@@ -415,6 +416,49 @@ async def criar_followup_privado(ticket_id: int, conteudo: str) -> int:
     )
     resp.raise_for_status()
     return resp.json()["id"]
+
+
+async def enviar_documento(nome_arquivo: str, conteudo: bytes, mime_tipo: str) -> int:
+    """Upload de um arquivo pro GLPI (Document), sem vincular a nenhum
+    chamado ainda - o vinculo e feito depois via vincular_documento_ticket.
+    Contrato confirmado ao vivo contra o GLPI real deste host: multipart com
+    um campo 'uploadManifest' (JSON) e o arquivo num campo 'filename[0]'."""
+    manifesto = json.dumps({"input": {"name": nome_arquivo, "_filename": [nome_arquivo]}})
+    resp = await _requisicao(
+        "POST",
+        "/Document",
+        data={"uploadManifest": manifesto},
+        files={"filename[0]": (nome_arquivo, conteudo, mime_tipo)},
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+async def vincular_documento_ticket(ticket_id: int, documento_id: int) -> None:
+    """Linka um Document ja existente (por id) ao chamado. Mesma chamada que
+    a tool MCP glpi_attach_document_to_ticket faz (Document_Item), so que
+    direta via _requisicao - sem precisar do Agent SDK pra isso.
+
+    Confirmado ao vivo: GLPI recusa esse vinculo (400, permissao) se o
+    chamado ja estiver FECHADO - nao e erro de configuracao, e uma regra de
+    negocio do proprio GLPI (Document_Item::canCreateItem)."""
+    resp = await _requisicao(
+        "POST",
+        "/Document_Item",
+        json={"input": {"documents_id": documento_id, "itemtype": "Ticket", "items_id": ticket_id}},
+    )
+    resp.raise_for_status()
+
+
+async def baixar_documento(documento_id: int) -> bytes:
+    """Bytes crus de um Document. Confirmado ao vivo: o header
+    Accept: application/octet-stream faz o GLPI responder o arquivo direto,
+    sem JSON."""
+    resp = await _requisicao(
+        "GET", f"/Document/{documento_id}", headers={"Accept": "application/octet-stream"}
+    )
+    resp.raise_for_status()
+    return resp.content
 
 
 async def aprovar_solucao(ticket_id: int) -> None:

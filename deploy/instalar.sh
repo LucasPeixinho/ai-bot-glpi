@@ -39,18 +39,39 @@ systemctl enable --now chatbot-glpi
 sleep 2
 systemctl --no-pager status chatbot-glpi || true
 
-echo "==> Apache (site chat.cdp.lub)"
-a2enmod proxy proxy_http headers >/dev/null
-ln -sf "$PROJETO/deploy/apache-chat.conf" /etc/apache2/sites-available/chatbot-glpi.conf
-a2ensite chatbot-glpi >/dev/null
+echo "==> nginx (porta de entrada unica - separa o chat do pool prefork do Apache/GLPI)"
+if ! command -v nginx >/dev/null; then
+    apt-get install -y nginx
+fi
+ln -sf "$PROJETO/deploy/nginx-chatbot.conf" /etc/nginx/sites-available/chatbot-glpi.conf
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/chatbot-glpi.conf /etc/nginx/sites-enabled/chatbot-glpi.conf
+nginx -t
+
+echo "==> Apache: move pra 127.0.0.1:8090 (so a porta muda - mod_php/GLPI intocados)"
+if grep -q "^Listen 80$" /etc/apache2/ports.conf; then
+    sed -i 's/^Listen 80$/Listen 127.0.0.1:8090/' /etc/apache2/ports.conf
+fi
+if grep -q "<VirtualHost \*:80>" /etc/apache2/sites-available/glpi.conf; then
+    sed -i 's/<VirtualHost \*:80>/<VirtualHost 127.0.0.1:8090>/' /etc/apache2/sites-available/glpi.conf
+fi
+if [ -L /etc/apache2/sites-enabled/chatbot-glpi.conf ]; then
+    a2dissite chatbot-glpi >/dev/null
+fi
 apache2ctl configtest
-systemctl reload apache2
+
+echo "==> Cutover: Apache solta a porta 80, nginx assume"
+systemctl restart apache2
+systemctl enable --now nginx
+systemctl reload nginx
 
 echo
 echo "==> Pronto. Verificacoes:"
-echo "    journalctl -u chatbot-glpi -f          (logs do servico)"
-echo "    curl -sI http://127.0.0.1:8100/        (app respondendo localmente)"
-echo "    http://chat.cdp.lub/                    (depois do DNS apontar pro 192.168.0.241)"
+echo "    journalctl -u chatbot-glpi -f                                (logs do servico)"
+echo "    curl -H 'Host: suporte.cdp.lub' http://127.0.0.1/            (GLPI via nginx->Apache:8090)"
+echo "    curl -H 'Host: chat.cdp.lub' http://127.0.0.1/               (chatbot via nginx->uvicorn:8100)"
+echo "    curl -H 'Host: qualquercoisa.invalido' http://127.0.0.1/     (deve fechar/444 - conexao vazia, sem resposta)"
+echo "    ss -tlnp | grep :80                                         (deve mostrar nginx, nao apache2)"
 
 # ---------------------------------------------------------------------------
 # TROCA PRO USUARIO DEDICADO (rodar quando a ANTHROPIC_API_KEY chegar)

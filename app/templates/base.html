@@ -233,5 +233,34 @@
 </head>
 <body>
   {% block conteudo %}{% endblock %}
+  <script>
+    // Som de notificacao compartilhado (chat do colaborador, painel e thread
+    // do tecnico) - tom curto gerado via Web Audio API, sem precisar de um
+    // arquivo de audio no repo. AudioContext e reaproveitado entre chamadas;
+    // resume() cobre o caso raro da politica de autoplay do navegador ainda
+    // nao ter sido liberada por um gesto do usuario (login/clique ja contam).
+    window.tocarSom = (function () {
+      let ctx = null;
+      return function () {
+        try {
+          if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+          if (ctx.state === 'suspended') ctx.resume();
+          const osc = ctx.createOscillator();
+          const ganho = ctx.createGain();
+          osc.type = 'sine';
+          osc.frequency.value = 880;
+          ganho.gain.setValueAtTime(0.0001, ctx.currentTime);
+          ganho.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.01);
+          ganho.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.18);
+          osc.connect(ganho);
+          ganho.connect(ctx.destination);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.2);
+        } catch (e) {
+          // Web Audio indisponivel/bloqueado - silencioso, nunca quebra a pagina
+        }
+      };
+    })();
+  </script>
 </body>
 </html>

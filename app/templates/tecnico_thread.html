@@ -193,6 +193,42 @@
   .rodape-chat input[type=text] { flex: 1; height: 42px; border-radius: 10px; }
   .rodape-chat button { flex-shrink: 0; padding: 0 14px; height: 42px; border-radius: 10px; font-size: 12px; }
 
+  /* anexos - preview antes de enviar e chip na bolha ja enviada */
+  .preview-anexo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 20px;
+    border-top: 1px solid var(--borda-fraca);
+    background: var(--superficie-fraca);
+    font: 400 12.5px 'Inter', sans-serif;
+    color: var(--texto-suave);
+  }
+  .preview-anexo .anexo-thumb-preview {
+    width: 32px;
+    height: 32px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--borda);
+  }
+  .preview-anexo span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .anexos-mensagem { margin-top: 6px; }
+  .anexo-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    color: var(--azul-link);
+    font: 400 12.5px 'Inter', sans-serif;
+  }
+  .anexo-thumb {
+    max-width: 180px;
+    max-height: 180px;
+    border-radius: 10px;
+    border: 1px solid var(--borda);
+    display: block;
+  }
+
   .aviso-somente-leitura {
     padding: 14px 20px calc(14px + env(safe-area-inset-bottom));
     border-top: 1px solid var(--borda-fraca);
@@ -247,6 +283,14 @@
               </div>
               <span class="rotulo-nota-privada" x-show="m.privado">Nota interna</span>
               <div class="bolha" x-show="m.texto" x-html="formatarTexto(m.texto)"></div>
+              <div class="anexos-mensagem" x-show="m.anexos && m.anexos.length">
+                <template x-for="a in (m.anexos || [])" :key="a.documento_id || a.nome_arquivo">
+                  <a :href="a.url" target="_blank" rel="noopener" class="anexo-item">
+                    <img x-show="(a.mime_tipo || '').startsWith('image/')" :src="a.url" class="anexo-thumb">
+                    <span x-show="!(a.mime_tipo || '').startsWith('image/')" class="anexo-arquivo">📄 <span x-text="a.nome_arquivo"></span></span>
+                  </a>
+                </template>
+              </div>
               <span class="timestamp" x-show="m.hora" x-text="m.hora"></span>
             </div>
           </template>
@@ -278,11 +322,20 @@
       </div>
     </div>
 
+    <input type="file" x-ref="arquivoInput" style="display:none"
+           accept="image/png,image/jpeg,image/webp,image/gif,application/pdf"
+           @change="arquivoSelecionado($event)">
+    <div class="preview-anexo" x-show="arquivo">
+      <img x-show="arquivoPreviewUrl" :src="arquivoPreviewUrl" class="anexo-thumb-preview">
+      <span x-show="!arquivoPreviewUrl" x-text="arquivo && arquivo.name"></span>
+      <button type="button" class="botao-icone" @click="removerArquivo()" aria-label="Remover anexo">×</button>
+    </div>
     <div class="rodape-chat" x-show="!somenteLeitura && !mostrarFormResolver">
+      <button type="button" class="botao-icone" :disabled="enviando" @click="$refs.arquivoInput.click()" aria-label="Anexar arquivo">📎</button>
       <input type="text" x-model="textoMensagem" placeholder="Escreve uma resposta ou nota..."
              :disabled="enviando" @keydown.enter="enviar(false)">
-      <button type="button" class="secundario" :disabled="enviando || !textoMensagem.trim()" @click="enviar(true)">Nota</button>
-      <button type="button" class="primario" :disabled="enviando || !textoMensagem.trim()" @click="enviar(false)">Responder</button>
+      <button type="button" class="secundario" :disabled="enviando || (!textoMensagem.trim() && !arquivo)" @click="enviar(true)">Nota</button>
+      <button type="button" class="primario" :disabled="enviando || (!textoMensagem.trim() && !arquivo)" @click="enviar(false)">Responder</button>
     </div>
     <div class="aviso-somente-leitura" x-show="somenteLeitura">Este chamado está fechado - só leitura.</div>
   </div>
@@ -304,6 +357,34 @@ function tecnicoThread(mensagensIniciais, chamadoInicial, tecnicoAtribuidoInicia
     textoSolucao: '',
     resolvendo: false,
     erroResolver: null,
+    arquivo: null,
+    arquivoPreviewUrl: null,
+
+    arquivoSelecionado(evento) {
+      const f = evento.target.files[0];
+      if (!f) return;
+      const tipos = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'];
+      if (!tipos.includes(f.type)) {
+        alert('Formato não suportado. Envie uma imagem (PNG/JPG/WEBP/GIF) ou PDF.');
+        evento.target.value = '';
+        return;
+      }
+      const limite = f.type === 'application/pdf' ? 15 * 1024 * 1024 : 5 * 1024 * 1024;
+      if (f.size > limite) {
+        alert('Arquivo muito grande (máximo ' + Math.round(limite / (1024 * 1024)) + 'MB).');
+        evento.target.value = '';
+        return;
+      }
+      this.arquivo = f;
+      this.arquivoPreviewUrl = f.type.startsWith('image/') ? URL.createObjectURL(f) : null;
+    },
+
+    removerArquivo() {
+      if (this.arquivoPreviewUrl) URL.revokeObjectURL(this.arquivoPreviewUrl);
+      this.arquivo = null;
+      this.arquivoPreviewUrl = null;
+      if (this.$refs.arquivoInput) this.$refs.arquivoInput.value = '';
+    },
 
     statusTexto() {
       const mapa = { 1: 'Novo', 2: 'Em atendimento', 3: 'Em atendimento', 4: 'Pendente', 5: 'Resolvido', 6: 'Fechado' };
@@ -337,8 +418,11 @@ function tecnicoThread(mensagensIniciais, chamadoInicial, tecnicoAtribuidoInicia
       fonte.onmessage = (msg) => {
         const evento = JSON.parse(msg.data);
         if (evento.tipo === 'mensagem') {
+          // nunca toca no eco da propria mensagem que o tecnico acabou de enviar
+          if (evento.mensagem.tipo !== 'tecnico') window.tocarSom();
           this.pushMensagem(evento.mensagem);
         } else if (evento.tipo === 'status') {
+          window.tocarSom();
           this.chamado.status = evento.chamado.status;
           if (evento.chamado.status === 6) {
             this.somenteLeitura = true;
@@ -367,17 +451,21 @@ function tecnicoThread(mensagensIniciais, chamadoInicial, tecnicoAtribuidoInicia
 
     async enviar(privado) {
       const texto = this.textoMensagem.trim();
-      if (!texto) return;
+      const arquivo = this.arquivo;
+      if (!texto && !arquivo) return;
       this.enviando = true;
       try {
         const rota = privado ? 'nota' : 'responder';
-        const corpo = new URLSearchParams({ mensagem: texto });
+        const corpo = new FormData();
+        corpo.set('mensagem', texto);
+        if (arquivo) corpo.set('arquivo', arquivo);
         const resp = await fetch('/tecnico/chamados/' + this.chamado.id + '/' + rota, {
           method: 'POST', body: corpo,
         });
         const dados = await resp.json();
         if (dados.ok) {
           this.textoMensagem = '';
+          this.removerArquivo();
           // a mensagem aparece via SSE em ate uns segundos - nao empurra
           // aqui pra nao duplicar quando o SSE tambem a entregar.
         } else {

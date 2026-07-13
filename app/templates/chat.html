@@ -377,6 +377,42 @@
     flex-shrink: 0;
   }
 
+  /* anexos - preview antes de enviar e chip na bolha ja enviada */
+  .preview-anexo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 20px;
+    border-top: 1px solid var(--borda-fraca);
+    background: var(--superficie-fraca);
+    font: 400 12.5px 'Inter', sans-serif;
+    color: var(--texto-suave);
+  }
+  .preview-anexo .anexo-thumb-preview {
+    width: 32px;
+    height: 32px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--borda);
+  }
+  .preview-anexo span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .anexos-mensagem { margin-top: 6px; }
+  .anexo-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    color: var(--azul-link);
+    font: 400 12.5px 'Inter', sans-serif;
+  }
+  .anexo-thumb {
+    max-width: 180px;
+    max-height: 180px;
+    border-radius: 10px;
+    border: 1px solid var(--borda);
+    display: block;
+  }
+
   .aviso-somente-leitura {
     padding: 14px 20px calc(14px + env(safe-area-inset-bottom));
     border-top: 1px solid var(--borda-fraca);
@@ -532,7 +568,15 @@
               </div>
               <div class="ferramenta" x-show="m.ferramenta" x-text="m.ferramenta"></div>
               <div class="bolha" x-show="m.texto" x-html="formatarTexto(m.texto)"></div>
-              <div class="timestamp" x-show="m.texto" x-text="m.hora"></div>
+              <div class="anexos-mensagem" x-show="m.anexos && m.anexos.length">
+                <template x-for="a in (m.anexos || [])" :key="a.documento_id || a.nome_arquivo">
+                  <a :href="a.url || a.previewUrl" target="_blank" rel="noopener" class="anexo-item">
+                    <img x-show="(a.mime_tipo || '').startsWith('image/')" :src="a.previewUrl || a.url" class="anexo-thumb">
+                    <span x-show="!(a.mime_tipo || '').startsWith('image/')" class="anexo-arquivo">📄 <span x-text="a.nome_arquivo"></span></span>
+                  </a>
+                </template>
+              </div>
+              <div class="timestamp" x-show="m.texto || (m.anexos && m.anexos.length)" x-text="m.hora"></div>
             </div>
           </template>
         </div>
@@ -556,11 +600,20 @@
     <template x-if="somenteLeitura">
       <div class="aviso-somente-leitura">Este chamado está fechado - só leitura.</div>
     </template>
+    <input type="file" x-ref="arquivoInput" style="display:none"
+           accept="image/png,image/jpeg,image/webp,image/gif,application/pdf"
+           @change="arquivoSelecionado($event)">
+    <div class="preview-anexo" x-show="arquivo">
+      <img x-show="arquivoPreviewUrl" :src="arquivoPreviewUrl" class="anexo-thumb-preview">
+      <span x-show="!arquivoPreviewUrl" x-text="arquivo && arquivo.name"></span>
+      <button type="button" class="botao-icone" @click="removerArquivo()" aria-label="Remover anexo">×</button>
+    </div>
     <form x-show="!somenteLeitura" class="rodape-chat" @submit.prevent="enviar()">
+      <button type="button" class="botao-icone" :disabled="enviando" @click="$refs.arquivoInput.click()" aria-label="Anexar arquivo">📎</button>
       <input type="text" x-model="entrada"
              :placeholder="modo === 'ajuda' ? 'Descreva seu problema...' : 'Escreva uma mensagem pro suporte...'"
              :disabled="enviando" x-ref="entrada" autocomplete="off">
-      <button type="submit" class="primario" :disabled="enviando || !entrada.trim()">Enviar</button>
+      <button type="submit" class="primario" :disabled="enviando || (!entrada.trim() && !arquivo)">Enviar</button>
     </form>
 
   </div>
@@ -588,6 +641,34 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
     statusAtual: chamadoInicial || null,
     sseFonte: null,
     sseRecebeuAlgumEvento: false,
+    arquivo: null,
+    arquivoPreviewUrl: null,
+
+    arquivoSelecionado(evento) {
+      const f = evento.target.files[0];
+      if (!f) return;
+      const tipos = ['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'];
+      if (!tipos.includes(f.type)) {
+        alert('Formato não suportado. Envie uma imagem (PNG/JPG/WEBP/GIF) ou PDF.');
+        evento.target.value = '';
+        return;
+      }
+      const limite = f.type === 'application/pdf' ? 15 * 1024 * 1024 : 5 * 1024 * 1024;
+      if (f.size > limite) {
+        alert('Arquivo muito grande (máximo ' + Math.round(limite / (1024 * 1024)) + 'MB).');
+        evento.target.value = '';
+        return;
+      }
+      this.arquivo = f;
+      this.arquivoPreviewUrl = f.type.startsWith('image/') ? URL.createObjectURL(f) : null;
+    },
+
+    removerArquivo() {
+      if (this.arquivoPreviewUrl) URL.revokeObjectURL(this.arquivoPreviewUrl);
+      this.arquivo = null;
+      this.arquivoPreviewUrl = null;
+      if (this.$refs.arquivoInput) this.$refs.arquivoInput.value = '';
+    },
 
     focoInicial() {
       this.$nextTick(() => this.$refs.entrada && this.$refs.entrada.focus());
@@ -690,8 +771,9 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
     },
 
     processarEventoNovidade(evento) {
+      window.tocarSom();
       if (evento.tipo === 'seguimento_tecnico') {
-        this.pushMensagem('suporte', evento.texto, {autorNome: evento.autor});
+        this.pushMensagem('suporte', evento.texto, {autorNome: evento.autor, anexos: evento.anexos || []});
       } else if (evento.tipo === 'tecnico_assumiu') {
         this.pushMensagem('tecnico_assumiu', '', {nome: evento.nome});
         if (this.statusAtual) this.statusAtual = {...this.statusAtual, tecnico: evento.nome};
@@ -773,7 +855,7 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
       }
     },
 
-    async enviarAjuda(texto) {
+    async enviarAjuda(texto, arquivo) {
       let indiceAtual = -1;
       const garantirBolha = () => {
         if (indiceAtual === -1) indiceAtual = this.pushMensagem('assistente', '');
@@ -782,8 +864,9 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
         indiceAtual = this.pushMensagem('assistente', '');
       };
 
-      const corpo = new URLSearchParams();
+      const corpo = new FormData();
       corpo.set('mensagem', texto);
+      if (arquivo) corpo.set('arquivo', arquivo);
       const resp = await fetch('/chamados/ajuda/mensagem', {method: 'POST', body: corpo});
       const leitor = resp.body.getReader();
       const decodificador = new TextDecoder();
@@ -835,7 +918,7 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
       }
     },
 
-    async enviarChamado(texto) {
+    async enviarChamado(texto, arquivo) {
       // Antes de um tecnico assumir o chamado, a IA continua respondendo
       // aqui (so passa a ser relay puro depois da atribuicao de verdade -
       // ver enviar_mensagem_chamado no backend) - por isso trata tanto
@@ -848,8 +931,9 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
         indiceAtual = this.pushMensagem('assistente', '');
       };
 
-      const corpo = new URLSearchParams();
+      const corpo = new FormData();
       corpo.set('mensagem', texto);
+      if (arquivo) corpo.set('arquivo', arquivo);
       const resp = await fetch('/chamados/' + this.statusAtual.id + '/mensagem', {method: 'POST', body: corpo});
       const leitor = resp.body.getReader();
       const decodificador = new TextDecoder();
@@ -866,7 +950,17 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
           if (!linha.trim()) continue;
           const evento = JSON.parse(linha);
 
-          if (evento.tipo === 'relay_ok') {
+          if (evento.tipo === 'anexo') {
+            // completa a bolha 'usuario' que subiu com preview local (blob)
+            // com a URL real de download, assim que o servidor confirma
+            for (let i = this.mensagens.length - 1; i >= 0; i--) {
+              if (this.mensagens[i].tipo === 'usuario' && this.mensagens[i].anexos && this.mensagens[i].anexos.length) {
+                this.mensagens[i].anexos[0].documento_id = evento.documento_id;
+                this.mensagens[i].anexos[0].url = '/chamados/' + this.statusAtual.id + '/anexos/' + evento.documento_id;
+                break;
+              }
+            }
+          } else if (evento.tipo === 'relay_ok') {
             this.digitando = false;
             this.pushMensagem('sistema', 'Mensagem enviada ao suporte.');
           } else if (evento.tipo === 'novo_texto') {
@@ -895,19 +989,24 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
 
     async enviar() {
       const texto = this.entrada.trim();
-      if (!texto || this.enviando) return;
+      const arquivo = this.arquivo;
+      if ((!texto && !arquivo) || this.enviando) return;
 
-      this.pushMensagem('usuario', texto);
+      const extra = arquivo
+        ? {anexos: [{previewUrl: this.arquivoPreviewUrl, nome_arquivo: arquivo.name, mime_tipo: arquivo.type}]}
+        : {};
+      this.pushMensagem('usuario', texto, extra);
       this.entrada = '';
+      this.removerArquivo();
       this.enviando = true;
       this.digitando = true;
       this.scrollParaFim();
 
       try {
         if (this.modo === 'ajuda') {
-          await this.enviarAjuda(texto);
+          await this.enviarAjuda(texto, arquivo);
         } else {
-          await this.enviarChamado(texto);
+          await this.enviarChamado(texto, arquivo);
         }
       } catch (e) {
         this.pushMensagem('sistema', 'Não consegui falar com o servidor agora. Tenta de novo.');
@@ -916,7 +1015,7 @@ function chatApp(mensagensIniciais, modo, chamadoInicial, somenteLeitura) {
         this.digitando = false;
         this.mensagens = this.mensagens.filter(m => {
           if (['usuario', 'assistente', 'suporte', 'sistema'].includes(m.tipo)) {
-            return m.texto || m.ferramenta;
+            return m.texto || m.ferramenta || (m.anexos && m.anexos.length);
           }
           return true;
         });

@@ -15,8 +15,8 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -45,11 +45,13 @@ from app.glpi import (
     STATUS_RESOLVIDO_OU_FECHADO,
     aprovar_solucao,
     atribuir_tecnico,
+    baixar_documento,
     buscar_todos_chamados_usuario,
     criar_followup_privado,
     criar_followup_publico,
     contar_atribuidos_por_status,
     criar_solucao,
+    enviar_documento,
     listar_atribuidos_ativos,
     listar_atribuidos_por_status,
     listar_fila,
@@ -61,6 +63,7 @@ from app.glpi import (
     obter_usuario_por_id,
     recusar_solucao,
     texto_prazo_confirmacao,
+    vincular_documento_ticket,
 )
 from app.usuarios import PAPEL_TECNICO, resolver_papel, resolver_usuario
 
@@ -132,12 +135,16 @@ def _formatar_hora(data_glpi: str | None) -> str | None:
     return momento.strftime("%d/%m %H:%M")
 
 
-def _status_humano(status: int, atribuido: bool) -> tuple[str, str]:
+def _status_humano(status: int, atribuido: bool, *, para_tecnico: bool = False) -> tuple[str, str]:
     """`atribuido` precisa vir de obter_tecnico_atribuido (Ticket_User de
     verdade) - NAO de modo_acompanhamento (que so reflete se ja teve
     followup de tecnico). Atribuir alguem no GLPI nao cria followup
     nenhum sozinho, entao usar modo_acompanhamento aqui deixava o rotulo
     preso em "Aguardando atendimento" mesmo depois de atribuido.
+
+    `para_tecnico`: o rotulo de RESOLVIDO muda de audiencia - pro
+    colaborador e uma instrucao ("confirme se funcionou"), pro tecnico e
+    so informativo (ele nao e quem confirma).
 
     Retorna (texto, classe) - a classe e uma chave estavel em ingles pro
     CSS/JS mapear cor semantica sem precisar comparar a string em
@@ -145,10 +152,66 @@ def _status_humano(status: int, atribuido: bool) -> tuple[str, str]:
     if status == STATUS_FECHADO:
         return "Fechado", "fechado"
     if status == STATUS_RESOLVIDO:
+        if para_tecnico:
+            return "Aguardando confirmação do usuário", "resolvido"
         return "Resolvido — confirme se funcionou", "resolvido"
     if atribuido:
         return "Em atendimento", "atendimento"
     return "Aguardando atendimento", "aguardando"
+
+
+TIPOS_ANEXO_PERMITIDOS = {"image/png", "image/jpeg", "image/webp", "image/gif", "application/pdf"}
+TAMANHO_MAX_IMAGEM_BYTES = 5 * 1024 * 1024
+TAMANHO_MAX_PDF_BYTES = 15 * 1024 * 1024
+
+
+class AnexoInvalido(Exception):
+    def __init__(self, motivo: str):
+        self.motivo = motivo
+
+
+async def _ler_e_validar_anexo(arquivo: UploadFile) -> bytes:
+    if arquivo.content_type not in TIPOS_ANEXO_PERMITIDOS:
+        raise AnexoInvalido("Formato não suportado. Envie uma imagem (PNG/JPG/WEBP/GIF) ou PDF.")
+    conteudo = await arquivo.read()
+    limite = TAMANHO_MAX_PDF_BYTES if arquivo.content_type == "application/pdf" else TAMANHO_MAX_IMAGEM_BYTES
+    if len(conteudo) > limite:
+        raise AnexoInvalido(f"Arquivo muito grande (máximo {limite // (1024 * 1024)}MB).")
+    return conteudo
+
+
+async def _processar_anexo(arquivo: UploadFile, ticket_id: int | None) -> dict:
+    """Valida, faz upload pro GLPI e (se ja existir chamado) vincula na hora.
+    NAO grava na tabela local - quem chama decide o followup_id (ou None)."""
+    conteudo = await _ler_e_validar_anexo(arquivo)
+    documento_id = await enviar_documento(arquivo.filename, conteudo, arquivo.content_type)
+    if ticket_id is not None:
+        await vincular_documento_ticket(ticket_id, documento_id)
+    return {"documento_id": documento_id, "nome_arquivo": arquivo.filename, "mime_tipo": arquivo.content_type}
+
+
+def _texto_com_aviso_anexo(mensagem: str, nome_arquivo: str | None) -> str:
+    """Nota textual pra IA reconhecer o anexo SEM analisar o conteudo
+    (decisao: sem visao computacional) - so concatena string, nunca muda o
+    formato de client.query()."""
+    if not nome_arquivo:
+        return mensagem
+    aviso = f"[Usuário anexou um arquivo: {nome_arquivo}]"
+    return f"{mensagem}\n\n{aviso}" if mensagem else aviso
+
+
+def _agrupar_anexos_por_followup(ticket_id: int, prefixo_url: str) -> dict[int | None, list[dict]]:
+    grupos: dict[int | None, list[dict]] = {}
+    for linha in db.listar_anexos_chamado(ticket_id):
+        grupos.setdefault(linha["followup_id"], []).append(
+            {
+                "documento_id": linha["glpi_document_id"],
+                "nome_arquivo": linha["nome_arquivo"],
+                "mime_tipo": linha["mime_tipo"],
+                "url": f"{prefixo_url}/{linha['glpi_document_id']}",
+            }
+        )
+    return grupos
 
 
 @asynccontextmanager
@@ -516,7 +579,9 @@ async def pagina_ajuda(request: Request):
 
 
 @app.post("/chamados/ajuda/mensagem")
-async def enviar_mensagem_ajuda(request: Request, mensagem: str = Form(...)):
+async def enviar_mensagem_ajuda(
+    request: Request, mensagem: str = Form(""), arquivo: UploadFile | None = File(None)
+):
     sessao_id = request.cookies.get(NOME_COOKIE_SESSAO)
     sessao = SESSOES_ATIVAS.get(sessao_id) if sessao_id else None
     client: ClaudeSDKClient | None = sessao.get("client_ajuda") if sessao else None
@@ -533,9 +598,30 @@ async def enviar_mensagem_ajuda(request: Request, mensagem: str = Form(...)):
         entradas_pendentes: dict[str, dict] = {}
         n_eventos = 0
 
+        mensagem_final = mensagem.strip()
+        if not mensagem_final and not arquivo:
+            yield _evento("erro", valor="Escreve algo ou anexa um arquivo antes de enviar.")
+            yield _evento("fim")
+            return
+
+        if arquivo:
+            # chamado ainda nao existe nesse modo - so vincula quando (e se)
+            # a IA criar um chamado nesta mesma conversa (ver bloco
+            # glpi_create_ticket abaixo). Se o usuario fechar a aba antes
+            # disso, o Document fica orfao no GLPI (aceitavel, sem limpeza
+            # automatica - fora de escopo).
+            try:
+                info_anexo = await _processar_anexo(arquivo, ticket_id=None)
+            except AnexoInvalido as erro:
+                yield _evento("erro", valor=erro.motivo)
+                yield _evento("fim")
+                return
+            sessao.setdefault("anexos_pendentes_ajuda", []).append(info_anexo)
+            mensagem_final = _texto_com_aviso_anexo(mensagem_final, arquivo.filename)
+
         try:
             async with sessao["lock"]:
-                await client.query(mensagem)
+                await client.query(mensagem_final)
 
                 async for msg in client.receive_response():
                     n_eventos += 1
@@ -578,6 +664,16 @@ async def enviar_mensagem_ajuda(request: Request, mensagem: str = Form(...)):
                                         "chamado registrado usuario=%s ticket_id=%s",
                                         usuario_id, novo_ticket_id,
                                     )
+                                    for pendente in sessao.get("anexos_pendentes_ajuda", []):
+                                        await vincular_documento_ticket(
+                                            novo_ticket_id, pendente["documento_id"]
+                                        )
+                                        db.registrar_anexo(
+                                            novo_ticket_id, usuario_id,
+                                            pendente["nome_arquivo"], pendente["mime_tipo"],
+                                            pendente["documento_id"], followup_id=None,
+                                        )
+                                    sessao["anexos_pendentes_ajuda"] = []
                                     entrada = entradas_pendentes.get(bloco.tool_use_id, {})
                                     yield _evento(
                                         "chamado_criado",
@@ -625,6 +721,40 @@ def _exigir_tecnico(sessao: dict | None) -> bool:
     return bool(sessao) and sessao["papel"] == PAPEL_TECNICO
 
 
+def _anexo_do_chamado_ou_none(ticket_id: int, documento_id: int):
+    """Confere que o documento pedido pertence de fato a ESSE chamado antes
+    de baixar - impede um usuario autorizado num chamado baixar o
+    documento_id de outro so trocando o numero na URL."""
+    for linha in db.listar_anexos_chamado(ticket_id):
+        if linha["glpi_document_id"] == documento_id:
+            return linha
+    return None
+
+
+@app.get("/chamados/{ticket_id}/anexos/{documento_id}")
+async def baixar_anexo_colaborador(request: Request, ticket_id: int, documento_id: int):
+    sessao = _sessao_ativa(request)
+    if not sessao or not await _autorizar_chamado(sessao["usuario"]["id"], ticket_id):
+        return JSONResponse({"erro": "Sessão expirada."}, status_code=403)
+    anexo = _anexo_do_chamado_ou_none(ticket_id, documento_id)
+    if not anexo:
+        return JSONResponse({"erro": "Anexo não encontrado."}, status_code=404)
+    conteudo = await baixar_documento(documento_id)
+    return Response(content=conteudo, media_type=anexo["mime_tipo"])
+
+
+@app.get("/tecnico/chamados/{ticket_id}/anexos/{documento_id}")
+async def baixar_anexo_tecnico(request: Request, ticket_id: int, documento_id: int):
+    sessao = _sessao_ativa(request)
+    if not _exigir_tecnico(sessao):
+        return JSONResponse({"erro": "Sessão expirada."}, status_code=403)
+    anexo = _anexo_do_chamado_ou_none(ticket_id, documento_id)
+    if not anexo:
+        return JSONResponse({"erro": "Anexo não encontrado."}, status_code=404)
+    conteudo = await baixar_documento(documento_id)
+    return Response(content=conteudo, media_type=anexo["mime_tipo"])
+
+
 @app.get("/chamados/{ticket_id}", response_class=HTMLResponse)
 async def pagina_chamado(request: Request, ticket_id: int):
     sessao = _sessao_ativa(request)
@@ -655,6 +785,7 @@ async def pagina_chamado(request: Request, ticket_id: int):
     await relay.garantir_estado_chamado(usuario["id"], ticket_id)
     db.marcar_chamado_visto(ticket_id)
     ids_usuario = db.followups_do_usuario(ticket_id)
+    anexos_por_followup = _agrupar_anexos_por_followup(ticket_id, f"/chamados/{ticket_id}/anexos")
 
     mensagens: list[dict] = [
         {"tipo": "sistema", "texto": f"Chamado #{ticket_id} - {resumo['titulo']}"},
@@ -672,6 +803,7 @@ async def pagina_chamado(request: Request, ticket_id: int):
                 "texto": resumo["descricao"],
                 "mostrarRotulo": True,
                 "hora": _formatar_hora(resumo["data_criacao_completa"]),
+                "anexos": anexos_por_followup.get(None, []),
             }
         )
         ultimo_tipo_conversacional = "assistente"
@@ -701,6 +833,7 @@ async def pagina_chamado(request: Request, ticket_id: int):
                     "texto": followup["conteudo"],
                     "hora": hora,
                     "mostrarRotulo": ultimo_tipo_conversacional != "usuario",
+                    "anexos": anexos_por_followup.get(followup["id"], []),
                 }
             )
             ultimo_tipo_conversacional = "usuario"
@@ -713,6 +846,7 @@ async def pagina_chamado(request: Request, ticket_id: int):
                 "autorNome": nomes_cache.get(followup["users_id"], "Suporte"),
                 "mostrarRotulo": ultimo_tipo_conversacional != "suporte",
                 "hora": hora,
+                "anexos": anexos_por_followup.get(followup["id"], []),
             }
         )
         ultimo_tipo_conversacional = "suporte"
@@ -831,7 +965,12 @@ def _evento(tipo: str, **campos) -> str:
 
 
 @app.post("/chamados/{ticket_id}/mensagem")
-async def enviar_mensagem_chamado(request: Request, ticket_id: int, mensagem: str = Form(...)):
+async def enviar_mensagem_chamado(
+    request: Request,
+    ticket_id: int,
+    mensagem: str = Form(""),
+    arquivo: UploadFile | None = File(None),
+):
     """Thread de um chamado ja existente. Regra: a IA so silencia depois que
     um TECNICO ASSUME o chamado de verdade (obter_tecnico_atribuido).
 
@@ -852,6 +991,24 @@ async def enviar_mensagem_chamado(request: Request, ticket_id: int, mensagem: st
     usuario = sessao["usuario"]
 
     async def gerar():
+        mensagem_final = mensagem.strip()
+        if not mensagem_final and not arquivo:
+            yield _evento("erro", valor="Escreve algo ou anexa um arquivo antes de enviar.")
+            yield _evento("fim")
+            return
+
+        info_anexo = None
+        if arquivo:
+            # ticket ja existe - vincula na hora, sem precisar de estado pendente
+            try:
+                info_anexo = await _processar_anexo(arquivo, ticket_id=ticket_id)
+            except AnexoInvalido as erro:
+                yield _evento("erro", valor=erro.motivo)
+                yield _evento("fim")
+                return
+            yield _evento("anexo", **info_anexo)
+            mensagem_final = _texto_com_aviso_anexo(mensagem_final, arquivo.filename)
+
         try:
             tecnico = await obter_tecnico_atribuido(ticket_id)
         except Exception:
@@ -862,8 +1019,13 @@ async def enviar_mensagem_chamado(request: Request, ticket_id: int, mensagem: st
 
         if tecnico:
             try:
-                novo_id = await criar_followup_publico(ticket_id, mensagem)
+                novo_id = await criar_followup_publico(ticket_id, mensagem_final)
                 db.marcar_followup_do_usuario(ticket_id, novo_id)
+                if info_anexo:
+                    db.registrar_anexo(
+                        ticket_id, usuario["id"], info_anexo["nome_arquivo"],
+                        info_anexo["mime_tipo"], info_anexo["documento_id"], followup_id=novo_id,
+                    )
                 estado_db = db.obter_estado_chamado(ticket_id)
                 if estado_db:
                     db.atualizar_estado_chamado(
@@ -878,16 +1040,22 @@ async def enviar_mensagem_chamado(request: Request, ticket_id: int, mensagem: st
             yield _evento("fim")
             return
 
+        if info_anexo:
+            db.registrar_anexo(
+                ticket_id, usuario["id"], info_anexo["nome_arquivo"],
+                info_anexo["mime_tipo"], info_anexo["documento_id"], followup_id=None,
+            )
+
         # ninguem assumiu ainda - a IA responde e decide se vale registrar
         # (conversa leve, sem criar chamado novo). Client novo e curto: sem
         # servidor stdio externo (so as tools em processo), conecta rapido.
         client: ClaudeSDKClient | None = None
         try:
-            opcoes = construir_opcoes_acompanhamento(ticket_id, usuario, mensagem)
+            opcoes = construir_opcoes_acompanhamento(ticket_id, usuario, mensagem_final)
             client = ClaudeSDKClient(opcoes)
             await client.connect()
             await aguardar_mcp_pronto(client)
-            await client.query(f'O colaborador mandou no chamado #{ticket_id}: "{mensagem}"')
+            await client.query(f'O colaborador mandou no chamado #{ticket_id}: "{mensagem_final}"')
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent):
                     evento = msg.event
@@ -1059,7 +1227,7 @@ def _decorar_chamados_tecnico(chamados: list[dict], atribuido: bool) -> list[dic
     decorados = []
     for c in chamados:
         grupo_status = _grupo_status_tecnico(c["status"])
-        status_texto, status_classe = _status_humano(c["status"], atribuido)
+        status_texto, status_classe = _status_humano(c["status"], atribuido, para_tecnico=True)
         if atribuido and grupo_status == "pendente":
             # _status_humano nao distingue pendente de "em atendimento"
             # (o colaborador ve os dois como a mesma coisa, de
@@ -1217,6 +1385,7 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
     )
     ids_usuario = db.followups_do_usuario(ticket_id)
     autores_tecnico = db.autores_tecnico_followups(ticket_id)
+    anexos_por_followup = _agrupar_anexos_por_followup(ticket_id, f"/tecnico/chamados/{ticket_id}/anexos")
 
     mensagens: list[dict] = [
         {"tipo": "sistema", "texto": f"Chamado #{ticket_id} - {resumo['titulo']}"},
@@ -1227,6 +1396,7 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
                 "tipo": "colaborador",
                 "texto": resumo["descricao"],
                 "hora": _formatar_hora(resumo["data_criacao_completa"]),
+                "anexos": anexos_por_followup.get(None, []),
             }
         )
 
@@ -1245,7 +1415,10 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
     for item in timeline:
         hora = _formatar_hora(item["data"])
         if item["id"] in ids_usuario:
-            mensagens.append({"tipo": "colaborador", "texto": item["conteudo"], "hora": hora})
+            mensagens.append({
+                "tipo": "colaborador", "texto": item["conteudo"], "hora": hora,
+                "anexos": anexos_por_followup.get(item["id"], []),
+            })
             continue
         if item["id"] in autores_tecnico:
             # respondido/anotado por este painel - o nome real do tecnico
@@ -1261,6 +1434,7 @@ async def _montar_timeline_tecnico(ticket_id: int) -> tuple[dict, list[dict]]:
                 "autorNome": autor_nome,
                 "privado": item["privado"],
                 "hora": hora,
+                "anexos": anexos_por_followup.get(item["id"], []),
             }
         )
 
@@ -1369,18 +1543,39 @@ async def tecnico_assumir(request: Request, ticket_id: int):
     return JSONResponse({"ok": True})
 
 
+async def _anexar_arquivo_tecnico(arquivo: UploadFile | None, ticket_id: int) -> dict | None:
+    """Valida+sobe+vincula um anexo do tecnico. Levanta AnexoInvalido - quem
+    chama decide como reportar (JSONResponse 422, mesmo padrao das rotas)."""
+    if not arquivo:
+        return None
+    return await _processar_anexo(arquivo, ticket_id=ticket_id)
+
+
 @app.post("/tecnico/chamados/{ticket_id}/responder")
-async def tecnico_responder(request: Request, ticket_id: int, mensagem: str = Form(...)):
+async def tecnico_responder(
+    request: Request,
+    ticket_id: int,
+    mensagem: str = Form(""),
+    arquivo: UploadFile | None = File(None),
+):
     sessao = _sessao_ativa(request)
     if not _exigir_tecnico(sessao):
         return JSONResponse({"ok": False, "erro": "Sessão expirada. Atualiza a página."}, status_code=403)
 
     mensagem = mensagem.strip()
-    if not mensagem:
-        return JSONResponse({"ok": False, "erro": "Escreve alguma coisa antes de enviar."}, status_code=422)
+    if not mensagem and not arquivo:
+        return JSONResponse(
+            {"ok": False, "erro": "Escreve algo ou anexa um arquivo antes de enviar."}, status_code=422
+        )
 
     try:
-        novo_id = await criar_followup_publico(ticket_id, mensagem)
+        info_anexo = await _anexar_arquivo_tecnico(arquivo, ticket_id)
+    except AnexoInvalido as erro:
+        return JSONResponse({"ok": False, "erro": erro.motivo}, status_code=422)
+
+    mensagem_final = _texto_com_aviso_anexo(mensagem, arquivo.filename if arquivo else None)
+    try:
+        novo_id = await criar_followup_publico(ticket_id, mensagem_final)
     except Exception:
         logger.exception("erro ao responder chamado=%s", ticket_id)
         return JSONResponse(
@@ -1388,22 +1583,40 @@ async def tecnico_responder(request: Request, ticket_id: int, mensagem: str = Fo
         )
 
     db.marcar_followup_do_tecnico(ticket_id, novo_id, sessao["usuario"]["nome_completo"])
+    if info_anexo:
+        db.registrar_anexo(
+            ticket_id, sessao["usuario"]["id"], info_anexo["nome_arquivo"],
+            info_anexo["mime_tipo"], info_anexo["documento_id"], followup_id=novo_id,
+        )
     logger.info("chamado=%s resposta publica tecnico=%s", ticket_id, sessao["usuario"]["login"])
     return JSONResponse({"ok": True})
 
 
 @app.post("/tecnico/chamados/{ticket_id}/nota")
-async def tecnico_nota(request: Request, ticket_id: int, mensagem: str = Form(...)):
+async def tecnico_nota(
+    request: Request,
+    ticket_id: int,
+    mensagem: str = Form(""),
+    arquivo: UploadFile | None = File(None),
+):
     sessao = _sessao_ativa(request)
     if not _exigir_tecnico(sessao):
         return JSONResponse({"ok": False, "erro": "Sessão expirada. Atualiza a página."}, status_code=403)
 
     mensagem = mensagem.strip()
-    if not mensagem:
-        return JSONResponse({"ok": False, "erro": "Escreve alguma coisa antes de enviar."}, status_code=422)
+    if not mensagem and not arquivo:
+        return JSONResponse(
+            {"ok": False, "erro": "Escreve algo ou anexa um arquivo antes de enviar."}, status_code=422
+        )
 
     try:
-        novo_id = await criar_followup_privado(ticket_id, mensagem)
+        info_anexo = await _anexar_arquivo_tecnico(arquivo, ticket_id)
+    except AnexoInvalido as erro:
+        return JSONResponse({"ok": False, "erro": erro.motivo}, status_code=422)
+
+    mensagem_final = _texto_com_aviso_anexo(mensagem, arquivo.filename if arquivo else None)
+    try:
+        novo_id = await criar_followup_privado(ticket_id, mensagem_final)
     except Exception:
         logger.exception("erro ao registrar nota chamado=%s", ticket_id)
         return JSONResponse(
@@ -1411,6 +1624,11 @@ async def tecnico_nota(request: Request, ticket_id: int, mensagem: str = Form(..
         )
 
     db.marcar_followup_do_tecnico(ticket_id, novo_id, sessao["usuario"]["nome_completo"])
+    if info_anexo:
+        db.registrar_anexo(
+            ticket_id, sessao["usuario"]["id"], info_anexo["nome_arquivo"],
+            info_anexo["mime_tipo"], info_anexo["documento_id"], followup_id=novo_id,
+        )
     logger.info("chamado=%s nota interna tecnico=%s", ticket_id, sessao["usuario"]["login"])
     return JSONResponse({"ok": True})
 

@@ -327,6 +327,7 @@ function painelTecnico(filaInicial, atribuidosInicial, contagensIniciais) {
       fonte.onmessage = (msg) => {
         recebeu = true;
         const dados = JSON.parse(msg.data);
+        this.tocarSomSeNovidade(dados);
         this.fila = dados.fila;
         this.atribuidos = dados.atribuidos;
         if (dados.contagens) this.contagens = dados.contagens;
@@ -342,6 +343,7 @@ function painelTecnico(filaInicial, atribuidosInicial, contagensIniciais) {
         try {
           const resp = await fetch('/tecnico/resumo');
           const dados = await resp.json();
+          this.tocarSomSeNovidade(dados);
           this.fila = dados.fila;
           this.atribuidos = dados.atribuidos;
           if (dados.contagens) this.contagens = dados.contagens;
@@ -349,6 +351,23 @@ function painelTecnico(filaInicial, atribuidosInicial, contagensIniciais) {
           // silencioso - tenta de novo no proximo ciclo
         }
       }, 10000);
+    },
+
+    // dados.fila/atribuidos ainda nao foram atribuidos quando isso roda -
+    // compara contra o snapshot ATUAL (this.fila/this.atribuidos) antes da
+    // troca. 'nova_mensagem' ja vem 100% calculado do backend - aqui so
+    // detecta a TRANSICAO de false/ausente para true.
+    tocarSomSeNovidade(dadosNovos) {
+      const filaAntigaIds = new Set(this.fila.map((c) => c.id));
+      const houveChamadoNovo = dadosNovos.fila.some((c) => !filaAntigaIds.has(c.id));
+
+      const atribuidosAntigos = new Map(this.atribuidos.map((c) => [c.id, c]));
+      const houveMensagemNova = dadosNovos.atribuidos.some((c) => {
+        const antigo = atribuidosAntigos.get(c.id);
+        return c.nova_mensagem && (!antigo || !antigo.nova_mensagem);
+      });
+
+      if (houveChamadoNovo || houveMensagemNova) window.tocarSom();
     },
 
     async assumir(ticketId) {

@@ -86,8 +86,22 @@ async def verificar_chamado(ticket_id: int, estado_db) -> list[dict]:
             )
             eventos.append({"tipo": "tecnico_assumiu", "nome": nome_autor})
 
+        anexos = db.anexos_do_followup(ticket_id, followup["id"])
         eventos.append(
-            {"tipo": "seguimento_tecnico", "autor": nome_autor, "texto": followup["conteudo"]}
+            {
+                "tipo": "seguimento_tecnico",
+                "autor": nome_autor,
+                "texto": followup["conteudo"],
+                "anexos": [
+                    {
+                        "documento_id": a["glpi_document_id"],
+                        "nome_arquivo": a["nome_arquivo"],
+                        "mime_tipo": a["mime_tipo"],
+                        "url": f"/chamados/{ticket_id}/anexos/{a['glpi_document_id']}",
+                    }
+                    for a in anexos
+                ],
+            }
         )
 
     if novos:

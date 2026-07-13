@@ -85,6 +85,20 @@ def inicializar_banco() -> None:
             )
             """
         )
+        conexao.execute(
+            """
+            CREATE TABLE IF NOT EXISTS anexos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                followup_id INTEGER,
+                users_id_autor INTEGER NOT NULL,
+                nome_arquivo TEXT NOT NULL,
+                mime_tipo TEXT NOT NULL,
+                glpi_document_id INTEGER NOT NULL,
+                criado_em TEXT NOT NULL
+            )
+            """
+        )
         _migrar_tabela_chamados_antiga(conexao)
         _migrar_coluna_papel_sessoes(conexao)
         _migrar_coluna_criado_pelo_bot(conexao)
@@ -355,3 +369,45 @@ def obter_vistos_tecnico(tecnico_id: int, ticket_ids: list[int]) -> dict[int, st
             [tecnico_id, *ticket_ids],
         ).fetchall()
         return {linha["ticket_id"]: linha["visto_em"] for linha in linhas}
+
+
+def registrar_anexo(
+    ticket_id: int,
+    users_id_autor: int,
+    nome_arquivo: str,
+    mime_tipo: str,
+    glpi_document_id: int,
+    followup_id: int | None = None,
+) -> int:
+    """Registra localmente um anexo ja enviado/vinculado no GLPI. followup_id
+    None quando o anexo ainda nao esta ligado a um followup de verdade (ex:
+    mandado no modo 'ajuda' antes do chamado existir, ou numa mensagem que a
+    IA decidiu nao registrar como followup) - nesse caso ele e mostrado
+    junto do card de descricao do chamado, nunca perdido silenciosamente."""
+    with conectar() as conexao:
+        cursor = conexao.execute(
+            "INSERT INTO anexos (ticket_id, followup_id, users_id_autor, nome_arquivo, "
+            "mime_tipo, glpi_document_id, criado_em) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ticket_id, followup_id, users_id_autor, nome_arquivo, mime_tipo, glpi_document_id, _agora()),
+        )
+        return cursor.lastrowid
+
+
+def listar_anexos_chamado(ticket_id: int) -> list[sqlite3.Row]:
+    """Todos os anexos de um chamado, em ordem de insercao - base pra
+    reconstruir o campo 'anexos' de cada mensagem (colaborador e tecnico)."""
+    with conectar() as conexao:
+        return conexao.execute(
+            "SELECT * FROM anexos WHERE ticket_id = ? ORDER BY id", (ticket_id,)
+        ).fetchall()
+
+
+def anexos_do_followup(ticket_id: int, followup_id: int) -> list[sqlite3.Row]:
+    """So os anexos de UM followup especifico - usado pelo relay pra decorar
+    o evento SSE 'seguimento_tecnico' sem recarregar todos os anexos do
+    chamado."""
+    with conectar() as conexao:
+        return conexao.execute(
+            "SELECT * FROM anexos WHERE ticket_id = ? AND followup_id = ?",
+            (ticket_id, followup_id),
+        ).fetchall()
